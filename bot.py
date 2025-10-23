@@ -35,7 +35,7 @@ OPENROUTER_API_KEY = (
 )
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://example.com")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "lord-verbus")
-MODEL = "deepseek/deepseek-r1:free"
+MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-nemo")
 
 print("[ENV CHECK] BOT_TOKEN set?:", bool(BOT_TOKEN))
 print("[ENV CHECK] OPENROUTER_API_KEY set?:", bool(OPENROUTER_API_KEY))
@@ -183,12 +183,19 @@ async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.
         ],
     }
     async with aiohttp.ClientSession() as session:
-        async with session.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=60) as r:
-            data = await r.json()
-            try:
-                return data["choices"][0]["message"]["content"]
-            except Exception:
-                return data.get("output") or str(data)
+    async with session.post("https://openrouter.ai/api/v1/chat/completions",
+                            headers=headers, json=body, timeout=60) as r:
+        data = await r.json()
+        # если пришла ошибка — кидаем исключение с понятным текстом
+        if r.status >= 400 or "error" in data:
+            msg = data.get("error", {}).get("message", str(data))
+            raise RuntimeError(f"OpenRouter error: {msg}")
+        try:
+            reply = await ai_reply(system, user, temperature=0.4)  # или 0.8
+        except Exception as e:
+            reply = f"Извините, модель сейчас недоступна: {e}"
+
+
 
 # ---------------- Bot ----------------
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
