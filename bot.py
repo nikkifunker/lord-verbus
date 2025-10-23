@@ -35,12 +35,14 @@ OPENROUTER_API_KEY = (
 )
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://example.com")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "lord-verbus")
+# Можно переопределить модель через переменную окружения OPENROUTER_MODEL
 MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-nemo")
 
 print("[ENV CHECK] BOT_TOKEN set?:", bool(BOT_TOKEN))
 print("[ENV CHECK] OPENROUTER_API_KEY set?:", bool(OPENROUTER_API_KEY))
 print("[ENV CHECK] OPENROUTER_SITE_URL set?:", bool(OPENROUTER_SITE_URL))
 print("[ENV CHECK] OPENROUTER_APP_NAME set?:", bool(OPENROUTER_APP_NAME))
+print("[ENV CHECK] OPENROUTER_MODEL:", MODEL)
 
 if not BOT_TOKEN or not OPENROUTER_API_KEY:
     missing = []
@@ -183,25 +185,26 @@ async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.
         ],
     }
     async with aiohttp.ClientSession() as session:
-    async with session.post("https://openrouter.ai/api/v1/chat/completions",
-                            headers=headers, json=body, timeout=60) as r:
-        data = await r.json()
-        # если пришла ошибка — кидаем исключение с понятным текстом
-        if r.status >= 400 or "error" in data:
-            msg = data.get("error", {}).get("message", str(data))
-            raise RuntimeError(f"OpenRouter error: {msg}")
-        try:
-            reply = await ai_reply(system, user, temperature=0.4)  # или 0.8
-        except Exception as e:
-            reply = f"Извините, модель сейчас недоступна: {e}"
-
-
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=body,
+            timeout=60
+        ) as r:
+            data = await r.json()
+            if r.status >= 400 or "error" in data:
+                msg = data.get("error", {}).get("message", str(data))
+                raise RuntimeError(f"OpenRouter error: {msg}")
+            try:
+                return data["choices"][0]["message"]["content"]
+            except Exception:
+                return data.get("output") or str(data)
 
 # ---------------- Bot ----------------
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# логируем только обычный текст (исключаем команды, чтобы они не перехватывались)
+# логируем только обычный текст (исключаем команды)
 @dp.message(F.text, ~F.text.regexp(r"^/"))
 async def catch_all(m: Message):
     db_execute(
@@ -244,7 +247,10 @@ async def cmd_summary(m: Message, command: CommandObject):
 
     system = persona_prompt(get_mode(m.chat.id)) + " В группах отвечайте лаконично. Если просят саммари — давайте структурно."
     user = "Суммируй диалог ниже в 7–10 пунктов: контекст, ключевые темы, договорённости, нерешённое.\n\n" + dialog_text
-    reply = await ai_reply(system, user, temperature=0.4)
+    try:
+        reply = await ai_reply(system, user, temperature=0.4)
+    except Exception as e:
+        reply = f"Извините, модель сейчас недоступна: {e}"
     await m.reply(reply)
 
 @dp.message(Command("lord_search"))
@@ -285,7 +291,7 @@ async def cmd_search(m: Message, command: CommandObject):
 
     def fmt(ts):
         dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
-        return dt.strftime("%d.%m %H:%M")
+        return dt.strftime("%d.%m %H:%М")
 
     out = []
     for _id, u, t, ts in rows[:10]:
@@ -310,7 +316,11 @@ async def periodic_replier():
                 mode = get_mode(chat_id)
                 system = persona_prompt(mode) + " Отвечайте очень коротко (1–2 фразы). Не задавайте много вопросов."
                 user = f"Это сообщение из группового чата. Ответь остроумной репликой по контексту:\n\n{('@'+pick_u if pick_u else 'user')}: {pick_t}"
-                reply = await ai_reply(system, user, temperature=0.8)
+                try:
+                    reply = await ai_reply(system, user, temperature=0.8)
+                except Exception:
+                    # молча пропускаем, если OpenRouter временно недоступен
+                    continue
                 try:
                     await bot.send_message(chat_id, reply)
                 except Exception:
