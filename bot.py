@@ -3,6 +3,7 @@ import asyncio
 import random
 import re
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -10,7 +11,9 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 # Локально можно .env; на Railway не мешает
 try:
     from dotenv import load_dotenv
