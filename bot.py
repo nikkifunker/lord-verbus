@@ -3,8 +3,7 @@ import asyncio
 import random
 import re
 import sqlite3
-from datetime import datetime, timedelta, timezone, date
-from contextlib import closing
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -12,17 +11,35 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 
-# --------- ENV ---------
+# Локально можно использовать .env, на Railway это не помешает
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# ==== Читаем ИМЕНА переменных окружения ====
 BOT_TOKEN = os.getenv("8294533627:AAHaVUzezxPox1J5JU838vonLJsoB5cbiM4")
 OPENROUTER_API_KEY = os.getenv("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")
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://example.com")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "lord-verbus")
-print("[ENV CHECK] BOT_TOKEN:", bool(BOT_TOKEN))
-print("[ENV CHECK] OPENROUTER_API_KEY:", bool(OPENROUTER_API_KEY))
-print("[ENV CHECK] SITE_URL:", bool(OPENROUTER_SITE_URL))
-print("[ENV CHECK] APP_NAME:", bool(OPENROUTER_APP_NAME))
 MODEL = "mistral/mistral-nemo"
-assert BOT_TOKEN and OPENROUTER_API_KEY, "Set BOT_TOKEN and OPENROUTER_API_KEY!"
+
+# Диагностика (не печатаем сами значения)
+print("[ENV CHECK] BOT_TOKEN set?:", bool(BOT_TOKEN))
+print("[ENV CHECK] OPENROUTER_API_KEY set?:", bool(OPENROUTER_API_KEY))
+print("[ENV CHECK] OPENROUTER_SITE_URL set?:", bool(OPENROUTER_SITE_URL))
+print("[ENV CHECK] OPENROUTER_APP_NAME set?:", bool(OPENROUTER_APP_NAME))
+
+if not BOT_TOKEN or not OPENROUTER_API_KEY:
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not OPENROUTER_API_KEY:
+        missing.append("OPENROUTER_API_KEY")
+    print(f"[Lord Verbus] Missing env: {', '.join(missing)}. "
+          f"Set them in Railway → Service → Variables and redeploy.")
+    raise SystemExit(1)
 
 # --------- DB (SQLite + FTS5) ---------
 DB = "verbus.db"
@@ -314,6 +331,7 @@ async def main():
     # периодическая задача
     asyncio.create_task(periodic_replier())
     # запускаем long-polling
+    print("[Lord Verbus] Online ✅ Starting long polling…")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
