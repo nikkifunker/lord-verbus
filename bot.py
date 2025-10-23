@@ -11,35 +11,47 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 
-# Локально можно использовать .env, на Railway это не помешает
+# Локально можно .env; на Railway не мешает
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# ==== Читаем ИМЕНА переменных окружения ====
-BOT_TOKEN = os.getenv("8294533627:AAHaVUzezxPox1J5JU838vonLJsoB5cbiM4")
-OPENROUTER_API_KEY = os.getenv("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")
+# Пробуем несколько имён (на случай залипших Shared/inline)
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TOKEN")
+)
+
+OPENROUTER_API_KEY = (
+    os.getenv("OPENROUTER_API_KEY")
+    or os.getenv("OPENROUTER_KEY")
+    or os.getenv("OR_API_KEY")
+    or os.getenv("OR_KEY")
+)
+
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://example.com")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "lord-verbus")
 MODEL = "mistral/mistral-nemo"
 
-# Диагностика (не печатаем сами значения)
+# Диагностика (покажем только факт наличия)
 print("[ENV CHECK] BOT_TOKEN set?:", bool(BOT_TOKEN))
 print("[ENV CHECK] OPENROUTER_API_KEY set?:", bool(OPENROUTER_API_KEY))
 print("[ENV CHECK] OPENROUTER_SITE_URL set?:", bool(OPENROUTER_SITE_URL))
 print("[ENV CHECK] OPENROUTER_APP_NAME set?:", bool(OPENROUTER_APP_NAME))
 
 if not BOT_TOKEN or not OPENROUTER_API_KEY:
+    # Временный дамп ключей, чтобы видеть, что реально пришло в контейнер
+    keys = [k for k in os.environ.keys() if "BOT" in k or "OPENROUTER" in k or k in ("TOKEN","OR_API_KEY")]
+    print("ENV KEYS SNAPSHOT:", sorted(keys))
     missing = []
-    if not BOT_TOKEN:
-        missing.append("BOT_TOKEN")
-    if not OPENROUTER_API_KEY:
-        missing.append("OPENROUTER_API_KEY")
-    print(f"[Lord Verbus] Missing env: {', '.join(missing)}. "
-          f"Set them in Railway → Service → Variables and redeploy.")
+    if not BOT_TOKEN: missing.append("BOT_TOKEN (fallback: TELEGRAM_BOT_TOKEN/TOKEN)")
+    if not OPENROUTER_API_KEY: missing.append("OPENROUTER_API_KEY (fallback: OPENROUTER_KEY/OR_API_KEY)")
+    print(f"[Lord Verbus] Missing env: {', '.join(missing)}. Set them in Railway → Service → Variables (inline) and Rebuild Image.")
     raise SystemExit(1)
+
 
 # --------- DB (SQLite + FTS5) ---------
 DB = "verbus.db"
