@@ -15,12 +15,12 @@ from aiogram.enums import ParseMode
 # --------- ENV ---------
 BOT_TOKEN = os.getenv("8294533627:AAHaVUzezxPox1J5JU838vonLJsoB5cbiM4")
 OPENROUTER_API_KEY = os.getenv("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")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://example.com")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "lord-verbus")
 print("[ENV CHECK] BOT_TOKEN:", bool(BOT_TOKEN))
 print("[ENV CHECK] OPENROUTER_API_KEY:", bool(OPENROUTER_API_KEY))
 print("[ENV CHECK] SITE_URL:", bool(OPENROUTER_SITE_URL))
 print("[ENV CHECK] APP_NAME:", bool(OPENROUTER_APP_NAME))
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://example.com")
-OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "lord-verbus")
 MODEL = "mistral/mistral-nemo"
 assert BOT_TOKEN and OPENROUTER_API_KEY, "Set BOT_TOKEN and OPENROUTER_API_KEY!"
 
