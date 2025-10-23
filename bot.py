@@ -12,6 +12,8 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+from aiogram.filters import CommandStart
 
 # Локально можно .env; на Railway не мешает
 try:
@@ -261,6 +263,15 @@ async def cmd_summary(m: Message, command: CommandObject):
     reply = await ai_reply(system, user, temperature=0.4)
     await m.reply(reply)
 
+@dp.message(CommandStart())
+async def cmd_start(m: Message):
+    await m.reply("Лорд Вербус к вашим услугам. Попробуй /lord_summary, /lord_search <запрос>, /lord_mode jester")
+
+@dp.message(Command("ping"))
+async def cmd_ping(m: Message):
+    await m.reply("pong")
+
+
 @dp.message(Command("lord_search"))
 async def cmd_search(m: Message, command: CommandObject):
     q = (command.args or "").strip()
@@ -339,14 +350,27 @@ async def periodic_replier():
         # случайный интервал 10–15 минут
         await asyncio.sleep(random.randint(600, 900))
 
+async def setup_commands():
+    base_cmds = [
+        BotCommand(command="ping", description="Проверка, жив ли бот"),
+        BotCommand(command="lord_summary", description="Саммари последних сообщений"),
+        BotCommand(command="lord_search", description="Поиск по чату"),
+        BotCommand(command="lord_mode", description="Режим ответа (default/jester/toxic/friendly)"),
+    ]
+    # Для групп
+    await bot.set_my_commands(base_cmds, scope=BotCommandScopeAllGroupChats())
+    # Для лички
+    await bot.set_my_commands(base_cmds, scope=BotCommandScopeAllPrivateChats())
+
+
 # --------- Main ---------
 async def main():
     init_db()
-    # периодическая задача
-    asyncio.create_task(periodic_replier())
-    # запускаем long-polling
+    await setup_commands()
     print("[Lord Verbus] Online ✅ Starting long polling…")
+    asyncio.create_task(periodic_replier())
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
