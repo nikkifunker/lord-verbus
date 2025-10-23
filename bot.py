@@ -38,7 +38,6 @@ OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://example.com")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "lord-verbus")
 MODEL = "mistral/mistral-nemo"
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 # Диагностика (покажем только факт наличия)
 print("[ENV CHECK] BOT_TOKEN set?:", bool(BOT_TOKEN))
 print("[ENV CHECK] OPENROUTER_API_KEY set?:", bool(OPENROUTER_API_KEY))
@@ -216,8 +215,8 @@ def persona_prompt(mode: str) -> str:
         return base + " Стиль: тёплый и поддерживающий, дружелюбный тон."
     return base + " Стиль: нейтральный с лёгким юмором."
 
-# --------- Bot ---------
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+# --- Создание бота ---
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 @dp.message(F.text)  # логируем только текст (стикеры можно добавить при желании)
