@@ -154,6 +154,10 @@ def parse_time_hint_ru(q: str):
 
     return None, None
 
+def escape_unsafe_html(s: str) -> str:
+    # порядок важен: сначала &, потом < и >
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 def get_mode(chat_id: int) -> str:
     row = db_query("SELECT mode FROM chat_modes WHERE chat_id=?;", (chat_id,))
     return row[0][0] if row else "default"
@@ -325,7 +329,9 @@ async def cmd_summary(m: Message, command: CommandObject):
     except Exception as e:
         reply = f"Суммаризация временно недоступна: {e}"
 
-    sent = await m.reply(reply)
+    safe = escape_unsafe_html(reply)
+    sent = await m.reply(safe)
+
     # Сохраним ссылку на последнюю сводку
     db_execute(
         "INSERT INTO last_summary(chat_id, message_id, created_at) VALUES(?, ?, ?) "
@@ -407,7 +413,7 @@ async def periodic_replier():
                     # молча пропускаем, если OpenRouter временно недоступен
                     continue
                 try:
-                    await bot.send_message(chat_id, reply)
+                    await bot.send_message(chat_id, escape_unsafe_html(reply))
                 except Exception:
                     pass
         except Exception:
