@@ -156,13 +156,37 @@ def sanitize_html_whitelist(text: str) -> str:
     return text
 
 def remove_unbalanced_tags(text: str) -> str:
+    """
+    Делает парные теги парными:
+    - если закрывающих больше — удаляем лишние с конца;
+    - если открывающих больше — доклеиваем недостающие закрывающие в конец;
+    - убираем вложенные <a> внутри <a>.
+    """
+    if not text:
+        return text
+
+    def balance_tag(t: str, tag: str) -> str:
+        open_pat = re.compile(fr"<{tag}\b[^>]*>", re.IGNORECASE)
+        close_pat = re.compile(fr"</{tag}>", re.IGNORECASE)
+        opens = len(open_pat.findall(t))
+        closes = len(close_pat.findall(t))
+        if closes > opens:
+            # срезаем лишние закрывающие теги с конца
+            for _ in range(closes - opens):
+                t = re.sub(fr"</{tag}>(?!.*</{tag}>)", "", t, flags=re.IGNORECASE)
+        elif opens > closes:
+            # доклеиваем недостающие закрывающие
+            t = t + ("</" + tag + ">") * (opens - closes)
+        return t
+
     for tag in ("b","i","u","s","del","code","pre","a","span"):
-        open_n = len(re.findall(fr"<{tag}\b[^>]*>", text, flags=re.IGNORECASE))
-        close_n = len(re.findall(fr"</{tag}>", text, flags=re.IGNORECASE))
-        if close_n > open_n:
-            for _ in range(close_n - open_n):
-                text = re.sub(fr"</{tag}>(?!.*</{tag}>)", "", text, flags=re.IGNORECASE)
+        text = balance_tag(text, tag)
+
+    # убираем вложенные <a>…<a>…</a> → оставляем внешний <a>
+    text = re.sub(r'(<a\b[^>]*>)([^<]*?)<a\b[^>]*>(.*?)</a>', r'\1\2\3', text, flags=re.IGNORECASE)
+
     return text
+
 
 MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)")
