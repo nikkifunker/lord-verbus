@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 import html as _html
 import re as _re
 import os, pathlib
-import json
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -110,6 +109,7 @@ def get_user_messages(chat_id: int, user_id: int | None, username: str | None, l
         )
     return []
 
+
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
@@ -137,7 +137,7 @@ def sanitize_html_whitelist(text: str) -> str:
     # оставляем только безопасные теги
     allowed_tags = {
         "b", "strong", "i", "em", "u", "s", "del", "code", "pre",
-        "a", "blockquote", "span"
+        "a", "br", "blockquote", "span"
     }
     # Безопасно чистим запрещённые теги
     def repl(m):
@@ -154,62 +154,6 @@ def sanitize_html_whitelist(text: str) -> str:
         ) + ">"
     ), text)
     return text
-
-def remove_unbalanced_tags(text: str) -> str:
-    """
-    Делает парные теги парными:
-    - если закрывающих больше — удаляем лишние с конца;
-    - если открывающих больше — доклеиваем недостающие закрывающие в конец;
-    - убираем вложенные <a> внутри <a>.
-    """
-    if not text:
-        return text
-
-    def balance_tag(t: str, tag: str) -> str:
-        open_pat = re.compile(fr"<{tag}\b[^>]*>", re.IGNORECASE)
-        close_pat = re.compile(fr"</{tag}>", re.IGNORECASE)
-        opens = len(open_pat.findall(t))
-        closes = len(close_pat.findall(t))
-        if closes > opens:
-            # срезаем лишние закрывающие теги с конца
-            for _ in range(closes - opens):
-                t = re.sub(fr"</{tag}>(?!.*</{tag}>)", "", t, flags=re.IGNORECASE)
-        elif opens > closes:
-            # доклеиваем недостающие закрывающие
-            t = t + ("</" + tag + ">") * (opens - closes)
-        return t
-
-    for tag in ("b","i","u","s","del","code","pre","a","span"):
-        text = balance_tag(text, tag)
-
-    # убираем вложенные <a>…<a>…</a> → оставляем внешний <a>
-    text = re.sub(r'(<a\b[^>]*>)([^<]*?)<a\b[^>]*>(.*?)</a>', r'\1\2\3', text, flags=re.IGNORECASE)
-
-    return text
-
-
-MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
-MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)")
-EXTRA_CLOSE_A_RE = re.compile(r"</a>\s*</a>", re.IGNORECASE)
-
-def normalize_for_telegram(text: str) -> str:
-    if not text:
-        return text
-    t = text
-    # минимальная поддержка markdown
-    t = MD_BOLD_RE.sub(r"<b>\1</b>", t)
-    t = MD_ITALIC_RE.sub(r"<i>\1</i>", t)
-
-    # привести кривые варианты переносов к \n (НЕ используем <br> вовсе)
-    t = t.replace("</br>", "\n").replace("<br/>", "\n").replace("<br>", "\n")
-
-    # прибираем двойные закрытия ссылок и пустые <a>
-    t = EXTRA_CLOSE_A_RE.sub("</a>", t)
-    t = re.sub(r'<a\s+href="[^"]*">\s*</a>', "", t, flags=re.IGNORECASE)
-    t = re.sub(r'<a\s+href="[^"]*">\s*<a\s+href="', '<a href="', t, flags=re.IGNORECASE)
-    t = re.sub(r'</a>\s*</a>', '</a>', t, flags=re.IGNORECASE)
-    return t
-
 
 def strip_outer_quotes(s: str) -> str:
     t = s.strip()
@@ -239,23 +183,35 @@ def tg_mention(user_id: int, display_name: str | None, username: str | None) -> 
 
 # ---- target user resolver (по reply, text_mention или @username)
 async def resolve_target_user(m: Message) -> tuple[int | None, str | None, str | None]:
+    """
+    Возвращает (user_id, display_name, username) для цели анализа:
+    - если команда дана в reply — берём автора исходного сообщения
+    - если есть text_mention — берём user.id
+    - если есть @username — пытаемся найти user_id в таблице users
+    """
+    # 1) reply
     if m.reply_to_message and m.reply_to_message.from_user:
         u = m.reply_to_message.from_user
         return u.id, (u.full_name or u.first_name), u.username
+
+    # 2) text_mention
     if m.entities:
         for ent in m.entities:
             if ent.type == "text_mention" and ent.user:
                 u = ent.user
                 return u.id, (u.full_name or u.first_name), u.username
+
+    # 3) @username из текста
     if m.entities:
         for ent in m.entities:
             if ent.type == "mention":
-                uname = (m.text or "")[ent.offset+1: ent.offset+ent.length]
+                uname = (m.text or "")[ent.offset+1: ent.offset+ent.length]  # без @
                 row = db_query("SELECT user_id, display_name, username FROM users WHERE LOWER(username)=LOWER(?) LIMIT 1;", (uname,))
                 if row:
                     uid, dname, un = row[0]
                     return uid, dname, un
-                return None, None, uname
+                return None, None, uname  # username есть, id не нашли (старые сообщения могли быть без user_id)
+
     return None, None, None
 
 # =========================
@@ -283,12 +239,13 @@ async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.
             return data["choices"][0]["message"]["content"].strip()
 
 # =========================
-# Linkify helpers
+# Linkify helpers (для саммари, в психо-аналитике не используем)
 # =========================
 LINK_PAT = re.compile(r"\[link:\s*(https?://[^\]\s]+)\s*\]")
-ANCHOR_PAT = re.compile(r"<a\s+href=\"(https?://[^\"]+)\"\s*>Источник</a>", re.IGNORECASE)
+ANCHOR_PAT = re.compile(r"<a\s+href=['\"](https?://[^'\"]+)['\"]\s*>Источник</a>", re.IGNORECASE)
 
 def _wrap_last_words(text: str, url: str, min_w: int = 2, max_w: int = 5) -> str:
+    # привяжем ссылку к последним 2–5 словам слева
     parts = re.split(r"(\s+)", text)
     words = []
     for i in range(len(parts)-1, -1, -1):
@@ -302,6 +259,7 @@ def _wrap_last_words(text: str, url: str, min_w: int = 2, max_w: int = 5) -> str
     if len(wonly) < min_w:
         return text
     k = min(len(wonly), max_w)
+    # склеиваем: берем последние k «словенных» токенов
     counter = 0
     left_safe = ""
     for t in reversed(tokens):
@@ -313,20 +271,24 @@ def _wrap_last_words(text: str, url: str, min_w: int = 2, max_w: int = 5) -> str
     left_final = left_safe.rstrip()
     if left != left_safe:
         left_final += left[len(left_safe):]
-    return left_final + f' <a href="{url}">' + right[len(left_final):] + "</a>"
+    return left_final + f" <a href='{url}'>" + right[len(left_final):] + "</a>"
 
 def smart_linkify(text: str) -> str:
+    """
+    1) [link: URL] → встроенная ссылка на предыдущие 2–5 слов
+    2) <a href='...'>Источник</a> → тоже превращаем в ссылку на предыдущие 2–5 слов
+    """
     urls = LINK_PAT.findall(text or "")
     for url in urls:
         text = _wrap_last_words(text, url)
-    for m in list(ANCHOR_PAT.finditer(text)):
+    for m in list(ANCHOR_PAT.finditer(text or "")):
         url = m.group(1)
         start, end = m.span()
         left = text[:start]
         right = text[end:]
         tmp = left + f"[link: {url}]" + right
         text = _wrap_last_words(tmp, url)
-    text = LINK_PAT.sub(lambda mm: f'<a href="{mm.group(1)}">ссылка</a>', text)
+    text = LINK_PAT.sub(lambda mm: f"<a href='{mm.group(1)}'>ссылка</a>", text)
     return text
 
 # =========================
@@ -356,6 +318,7 @@ async def cmd_summary(m: Message, command: CommandObject):
     prev_link = prev_summary_link(m.chat.id)
     prev_line_html = f'<a href="{prev_link}">Предыдущий анализ</a>' if prev_link else "Предыдущий анализ (—)"
 
+    # Собираем участников и превращаем в кликабельные имена
     user_ids = tuple({r[0] for r in rows})
     users_map = {}
     if user_ids:
@@ -409,13 +372,11 @@ async def cmd_summary(m: Message, command: CommandObject):
     try:
         reply = await ai_reply(system, user, temperature=0.2)
         reply = smart_linkify(reply)
-        reply = normalize_for_telegram(reply)
-        safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
-        sent = await m.reply(safe)
     except Exception as e:
-        fallback = _html.escape(strip_outer_quotes(str(e)))
-        sent = await m.reply(f"Суммаризация временно недоступна: {fallback}")
+        reply = f"Суммаризация временно недоступна: {e}"
 
+    safe = sanitize_html_whitelist(reply)
+    sent = await m.reply(safe)
     db_execute(
         "INSERT INTO last_summary(chat_id, message_id, created_at) VALUES (?, ?, ?)"
         "ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id, created_at=excluded.created_at;",
@@ -423,12 +384,14 @@ async def cmd_summary(m: Message, command: CommandObject):
     )
 
 # =========================
-# Психологический портрет
+# Психологический портрет (простой: 3 абзаца, без ссылок и <br>)
 # =========================
 @dp.message(Command("lord_psych"))
 async def cmd_lord_psych(m: Message, command: CommandObject):
     """
-    /lord_psych — в reply к пользователю или /lord_psych @username
+    Использование:
+      • Ответь командой на сообщение пользователя:   (reply) /lord_psych
+      • Или укажи @username в команде:               /lord_psych @nikki
     """
     target_id, display_name, uname = await resolve_target_user(m)
     if not target_id and not uname:
@@ -446,14 +409,6 @@ async def cmd_lord_psych(m: Message, command: CommandObject):
     texts = [t for (t, mid, ts) in rows]
     def clean(s): 
         return re.sub(r"\s+", " ", (s or "")).strip()
-    snippets = []
-    for t, mid, ts in rows[:200]:
-        t = clean(t)
-        if 8 <= len(t) <= 200:
-            link = tg_link(m.chat.id, mid) if mid else ""
-            snippets.append(f"• {t}" + (f" [link: {link}]" if link else ""))
-    snippets = snippets[:20] if len(snippets) > 20 else snippets
-
     joined = " \n".join(clean(t) for t in texts[:500])
     if len(joined) > 8000:
         joined = joined[:8000]
@@ -461,42 +416,34 @@ async def cmd_lord_psych(m: Message, command: CommandObject):
     dname = display_name or uname or "участник"
     target_html = tg_mention(target_id or 0, dname, uname)
 
+    # === Обновлённые промпты: 3 абзаца, без ссылок, без <br> ===
     system = (
         "Ты — «Лорд Вербус»: остроумный, язвительный аристократ с холодным чувством превосходства. "
-        "Ты создаёшь НЕклинический психологический портрет человека по его переписке. "
-        "Запрещены диагнозы и любые упоминания личных чувствительных тем (религия, здоровье, политика, интим). "
-        "Формат — три абзаца HTML-текста, без пунктов и списков: \n"
-        "1) Вступление — имя участника и короткое вводное описание, кто он в контексте общения (1–2 предложения).\n"
-        "2) Основная часть — психологический портрет, манера речи, поведенческие паттерны, особенности самоиронии, "
-        "мотиваторы, слабости и отношение к людям (3–4 предложения). Вплети 2–3 цитаты как короткие вставки в кавычках, "
-        "используя встроенные ссылки на 2–5 слов (URL бери из [link: ...]). Не используй слово «Источник».\n"
-        "3) Заключение — вердикт и оценка персонажа (1–2 предложения), в фирменном стиле Лорда — с язвительным обаянием.\n"
-        "Не добавляй дополнительных заголовков, списков, эмодзи, и не используй Markdown. "
-        "Сохрани изящество, метафоры и лёгкое презрение."
+        "Пишешь НЕклинический психологический портрет по переписке человека. "
+        "Не ставь диагнозов и не затрагивай чувствительные темы (религия, здоровье, политика, интим). "
+        "Формат — ровно три абзаца обычного текста (без списков, без заголовков, без <br>). "
+        "Абзацы должны быть разделены пустой строкой. "
+        "Тон — изящная ирония, уверенность и лёгкое превосходство, без прямых оскорблений."
     )
 
     user = (
         f"Цель анализа: {target_html}\n\n"
-        "Ниже корпус сообщений (новые → старые). Используй стиль, тон и лексику, чтобы понять личность:\n\n"
+        "Ниже корпус сообщений (новые → старые). Используй стиль, лексику, ритм и поведенческие маркеры:\n\n"
         f"{joined}\n\n"
-        "Подборка коротких фраз со ссылками (формат «текст [link: URL]» — встрои ссылки в цитаты):\n"
-        + ("\n".join(snippets) if snippets else "—") +
-        "\n\n"
-        "Сгенерируй ответ строго в виде ТРЁХ абзацев. Каждый абзац отдели ПУСТОЙ СТРОКОЙ (двойным переводом строки). "
-        "Первый — вводное описание и характер. "
-        "Второй — анализ речи, поведения, мотивов и противоречий, с 2–3 встроенными цитатами со ссылками. "
-        "Третий — краткий саркастичный вердикт в духе Лорда Вербуса."
+        "Сформируй вывод из 3 абзацев:\n"
+        "1) Вступление — назови участника по имени (жирным) и дай короткое вводное описание.\n"
+        "2) Основная часть — психологический портрет: манера речи, мотиваторы, отношение к спору/риску, слепые зоны.\n"
+        "3) Заключение — лаконичный саркастичный вердикт в стиле Лорда.\n"
+        "Не вставляй ссылки и HTML, кроме <b>жирного</b> для имени в первом абзаце."
     )
 
     try:
         reply = await ai_reply(system, user, temperature=0.55)
-        reply = smart_linkify(reply)
-        reply = normalize_for_telegram(reply)
-        safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
-        await m.reply(safe)
+        reply = strip_outer_quotes(reply)
+        # ничего не линкуем; оставляем только безопасные теги (допустимы <b>/<i> и т.п.)
+        await m.reply(sanitize_html_whitelist(reply))
     except Exception as e:
-        fallback = _html.escape(strip_outer_quotes(str(e)))
-        await m.reply(f"Портрет временно недоступен: {fallback}")
+        await m.reply(f"Портрет временно недоступен: {e}")
 
 # =========================
 # Small talk / interjections
@@ -577,9 +524,7 @@ async def reply_to_mention(m: Message):
     try:
         reply = await ai_reply(system, user, temperature=0.66)
         reply = strip_outer_quotes(reply)
-        reply = normalize_for_telegram(reply)
-        safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
-        await m.reply(safe)
+        await m.reply(sanitize_html_whitelist(reply))
     finally:
         bump_reply_counter()
 
@@ -600,11 +545,10 @@ async def reply_to_thread(m: Message):
     )
     reply = await ai_reply(system, user, temperature=0.66)
     reply = strip_outer_quotes(reply)
-    reply = normalize_for_telegram(reply)
-    safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
-    await m.reply(safe)
+    await m.reply(sanitize_html_whitelist(reply))
 
 async def maybe_interject(m: Message):
+    # вмешиваемся иногда, если явный вопрос и не «тихий час»
     local_dt = datetime.now()
     if is_quiet_hours(local_dt): return
     if not is_question(m.text or ""): return
@@ -626,9 +570,7 @@ async def maybe_interject(m: Message):
     try:
         reply = await ai_reply(system, user, temperature=0.66)
         reply = strip_outer_quotes(reply)
-        reply = normalize_for_telegram(reply)
-        safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
-        await m.reply(safe)
+        await m.reply(sanitize_html_whitelist(reply))
     finally:
         bump_reply_counter()
 
@@ -649,6 +591,7 @@ async def on_text(m: Message):
     if not m.text:
         return
 
+    # логируем текст
     if not m.text.startswith("/"):
         db_execute(
             "INSERT INTO messages(chat_id, user_id, username, text, created_at, message_id) VALUES (?, ?, ?, ?, ?, ?);",
@@ -656,6 +599,7 @@ async def on_text(m: Message):
              m.from_user.username if m.from_user else None,
              m.text, now_ts(), m.message_id)
         )
+        # — обновляем карточку пользователя (для кликабельных имён в саммари)
         if m.from_user:
             full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
             db_execute(
