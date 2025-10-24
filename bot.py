@@ -7,6 +7,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import html as _html
 import re as _re
+import os, pathlib
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -24,6 +25,8 @@ OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://t.me/lordverbus_
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Lord Verbus")
 MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini-2024-07-18")
 DB = os.getenv("DB_PATH", "bot.sqlite3")
+pathlib.Path(os.path.dirname(DB) or ".").mkdir(parents=True, exist_ok=True)
+print(f"[DB] Using SQLite at: {os.path.abspath(DB)}")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
