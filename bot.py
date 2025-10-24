@@ -278,7 +278,7 @@ def prev_summary_link(chat_id: int):
     prev = db_query("SELECT message_id FROM last_summary WHERE chat_id=?;", (chat_id,))
     return tg_link(chat_id, prev[0][0]) if prev and prev[0][0] else None
 
-@dp.message(Command("lord_summary")))
+@dp.message(Command("lord_summary"))
 async def cmd_summary(m: Message, command: CommandObject):
     try:
         n = int((command.args or "").strip())
