@@ -15,7 +15,9 @@ from aiogram.client.default import DefaultBotProperties
 import html as _html
 import re as _re
 
-# ------------- ENV -------------
+# =========================
+# ENV
+# =========================
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -40,7 +42,9 @@ MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-nemo")
 if not BOT_TOKEN or not OPENROUTER_API_KEY:
     raise SystemExit("[Lord Verbus] Missing envs: BOT_TOKEN or OPENROUTER_API_KEY")
 
-# ------------- DB -------------
+# =========================
+# DB
+# =========================
 DB = "verbus.db"
 
 def init_db():
@@ -105,7 +109,9 @@ def db_query(sql, params=()):
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
-# ------------- Helpers -------------
+# =========================
+# Helpers
+# =========================
 QUESTION_PATTERNS = [
     r"\?",
     r"\bкто\b", r"\bчто\b", r"\bкак\b", r"\bпочему\b", r"\bзачем\b",
@@ -116,8 +122,7 @@ QUESTION_PATTERNS = [
 QUESTION_RE = re.compile("|".join(QUESTION_PATTERNS), re.IGNORECASE)
 
 def is_question(text: str) -> bool:
-    if not text: return False
-    return bool(QUESTION_RE.search(text))
+    return bool(text and QUESTION_RE.search(text))
 
 def mentions_bot(text: str, bot_username: str | None) -> bool:
     if not text or not bot_username: return False
@@ -128,12 +133,25 @@ def is_quiet_hours(local_dt: datetime) -> bool:
 
 def sanitize_html_whitelist(text: str) -> str:
     esc = _html.escape(text)
+    # разрешённые теги
     esc = _re.sub(r"&lt;a href=&quot;([^&]*)&quot;&gt;(.*?)&lt;/a&gt;", r'<a href="\1">\2</a>', esc, flags=_re.DOTALL)
     esc = esc.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
     esc = esc.replace("&lt;i&gt;", "<i>").replace("&lt;/i&gt;", "</i>")
     esc = esc.replace("&lt;u&gt;", "<u>").replace("&lt;/u&gt;", "</u>")
     esc = esc.replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
     return esc
+
+# — срезаем внешние кавычки у ответа, если модель вдруг процитировала весь текст
+QUOTE_PAIRS = {'"':'"', '“':'”', '«':'»', '„':'“', '‘':'’', '‚':'‘', '‹':'›', "'":"'"}
+def strip_outer_quotes(text: str) -> str:
+    if not text or len(text) < 2:
+        return text
+    start, end = text[0], text[-1]
+    if start in QUOTE_PAIRS and QUOTE_PAIRS[start] == end:
+        inner = text[1:-1].strip()
+        if inner and any(c.isalnum() for c in inner):
+            return inner
+    return text
 
 def recent_chat_activity(chat_id: int, minutes: int) -> int:
     since = now_ts() - minutes * 60
@@ -153,7 +171,7 @@ def mark_auto_reply(chat_id: int):
         (chat_id, ts)
     )
 
-# — изящные эпитеты: редкие, не шаблон «чёрт побери»
+# — изящные эпитеты: редкие, без заезженного «чёрт побери»
 EPITHETS = [
     "к лешему", "к дьяволу", "будь оно неладно", "адская мешанина", "святая простота",
     "риторический мусор", "буря в стакане", "какого лешего", "ни в какие ворота",
@@ -185,10 +203,13 @@ def persona_prompt_natural() -> str:
         "Если в реплике есть вопрос — приоритизируй конкретный ответ одной-двумя фразами; "
         "можно добавить едкую ремарку, но коротко и уместно. "
         "Редкие изящные ругательства допускаются (на обстоятельства, не на людей) и только изредка. "
-        "Не обращайся по имени и не используй @. Пиши живо."
+        "Не обращайся по имени и не используй @. "
+        "ВАЖНО: не заключай весь ответ в кавычки и не цитируй свой собственный текст."
     )
 
-# ------------- OpenRouter -------------
+# =========================
+# OpenRouter
+# =========================
 async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.68):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -220,11 +241,12 @@ async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.
             except Exception:
                 return data.get("output") or str(data)
 
-# ------------- Bot -------------
+# =========================
+# Bot
+# =========================
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ----- Commands setup
 async def setup_commands():
     base_cmds = [
         BotCommand(command="ping", description="Проверка, жив ли бот"),
@@ -234,7 +256,7 @@ async def setup_commands():
     await bot.set_my_commands(base_cmds, scope=BotCommandScopeAllGroupChats())
     await bot.set_my_commands(base_cmds, scope=BotCommandScopeAllPrivateChats())
 
-# ----- Links / utils
+# ----- Links
 def tg_link(chat_id: int, message_id: int) -> str:
     s = str(chat_id)
     cid = s[4:] if s.startswith("-100") else s.lstrip("-")
@@ -244,7 +266,9 @@ def prev_summary_link(chat_id: int):
     prev = db_query("SELECT message_id FROM last_summary WHERE chat_id=?;", (chat_id,))
     return tg_link(chat_id, prev[0][0]) if prev and prev[0][0] else None
 
-# ------------- SUMMARY (стабильный шаблон) -------------
+# =========================
+# SUMMARY (стабильный шаблон)
+# =========================
 @dp.message(Command("lord_summary"))
 async def cmd_summary(m: Message, command: CommandObject):
     try:
@@ -274,7 +298,9 @@ async def cmd_summary(m: Message, command: CommandObject):
     system = (
         persona_prompt_natural()
         + " Ты оформляешь отчёт по чату. Формат — HTML. Строго соблюдай шаблон. "
-          "Никаких списков 'Ключевых моментов', никаких <h1>/<center>."
+          "Никаких списков 'Ключевых моментов', никаких <h1>/<center>. "
+          "Обязательно делай минимум по ОДНОЙ гиперссылке <a href='URL'>…</a> в КАЖДОМ тематическом абзаце. "
+          "Не заключай абзацы целиком в кавычки."
     )
     user = (
         f"{dialog_block}\n\n"
@@ -292,6 +318,8 @@ async def cmd_summary(m: Message, command: CommandObject):
 
     try:
         reply = await ai_reply(system, user, temperature=0.2)
+        # превратим [link: URL] в кликабельное <a>
+        reply = re.sub(r"\[link:\s*(https?://\S+)\]", r"<a href='\1'>ссылка</a>", reply)
     except Exception as e:
         reply = f"Суммаризация временно недоступна: {e}"
 
@@ -303,7 +331,9 @@ async def cmd_summary(m: Message, command: CommandObject):
         (m.chat.id, sent.message_id, now_ts())
     )
 
-# ------------- SEARCH -------------
+# =========================
+# SEARCH
+# =========================
 @dp.message(Command("lord_search"))
 async def cmd_search(m: Message, command: CommandObject):
     q = (command.args or "").strip()
@@ -384,7 +414,9 @@ async def cmd_search(m: Message, command: CommandObject):
             lines.append(f"• <b>{fmt(ts)}</b> — {who}: {sanitize_html_whitelist(t)}")
     await m.reply("Нашёл:\n" + "\n".join(lines))
 
-# ------------- Dialog replies -------------
+# =========================
+# Dialog replies
+# =========================
 async def reply_to_mention(m: Message):
     if is_quiet_hours(datetime.now().astimezone()):
         return
@@ -403,6 +435,7 @@ async def reply_to_mention(m: Message):
     )
     try:
         reply = await ai_reply(system, user, temperature=0.66)
+        reply = strip_outer_quotes(reply)
         await m.reply(sanitize_html_whitelist(reply))
     finally:
         bump_reply_counter()
@@ -425,12 +458,13 @@ async def reply_to_thread(m: Message):
     )
     try:
         reply = await ai_reply(system, user, temperature=0.68)
+        reply = strip_outer_quotes(reply)
         await m.reply(sanitize_html_whitelist(reply))
     finally:
         bump_reply_counter()
 
 async def maybe_interject(m: Message):
-    """Редкое вмешательство: только если есть вопрос, активность и кулдаун 10 минут."""
+    """Редкое вмешательство: вопрос + активность + кулдаун 10 минут/чат."""
     if is_quiet_hours(datetime.now().astimezone()):
         return
     if not is_question(m.text or ""):
@@ -455,12 +489,15 @@ async def maybe_interject(m: Message):
     )
     try:
         reply = await ai_reply(system, user, temperature=0.7)
+        reply = strip_outer_quotes(reply)
         await m.reply(sanitize_html_whitelist(reply))
         mark_auto_reply(m.chat.id)
     finally:
         bump_reply_counter()
 
-# ------------- Handlers -------------
+# =========================
+# Handlers
+# =========================
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     await m.reply("Лорд Вербус к вашим услугам. Команды: /ping, /lord_summary [N], /lord_search <запрос>")
@@ -496,10 +533,12 @@ async def catcher(m: Message):
         await reply_to_mention(m)
         return
 
-    # 3) редкое вмешательство (не чаще 1 раза в 10 минут/чат)
+    # 3) редкое вмешательство
     await maybe_interject(m)
 
-# ------------- Main -------------
+# =========================
+# Main
+# =========================
 async def main():
     init_db()
     await setup_commands()
