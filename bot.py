@@ -496,7 +496,7 @@ EPITHETS = [
     "слов много, смысл — турист без визы",
 ]
 
-def maybe_pick_epithet(p: float = 0.2, min_gap: int = 20) -> str | None:
+def maybe_pick_epithet(p: float = 0.2, min_gap: int = 60) -> str | None:
     if random.random() > p:
         return None
     return random.choice(EPITHETS)
