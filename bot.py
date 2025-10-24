@@ -92,6 +92,24 @@ def db_query(sql: str, params: tuple = ()):
         cur = conn.execute(sql, params)
         return cur.fetchall()
 
+def get_user_messages(chat_id: int, user_id: int | None, username: str | None, limit: int = 500):
+    """
+    Возвращает список (text, message_id, created_at) по пользователю.
+    Если есть user_id — ищем по нему. Если нет — пытаемся по username (хуже).
+    """
+    if user_id:
+        return db_query(
+            "SELECT text, message_id, created_at FROM messages WHERE chat_id=? AND user_id=? AND text IS NOT NULL ORDER BY id DESC LIMIT ?;",
+            (chat_id, user_id, limit)
+        )
+    if username:
+        return db_query(
+            "SELECT text, message_id, created_at FROM messages WHERE chat_id=? AND username=? AND text IS NOT NULL ORDER BY id DESC LIMIT ?;",
+            (chat_id, username, limit)
+        )
+    return []
+
+
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
@@ -162,6 +180,39 @@ def tg_mention(user_id: int, display_name: str | None, username: str | None) -> 
     name = (display_name or username or "гость").strip()
     safe = _html.escape(name)
     return f"<a href=\"tg://user?id={user_id}\">{safe}</a>"
+
+# ---- target user resolver (по reply, text_mention или @username)
+async def resolve_target_user(m: Message) -> tuple[int | None, str | None, str | None]:
+    """
+    Возвращает (user_id, display_name, username) для цели анализа:
+    - если команда дана в reply — берём автора исходного сообщения
+    - если есть text_mention — берём user.id
+    - если есть @username — пытаемся найти user_id в таблице users
+    """
+    # 1) reply
+    if m.reply_to_message and m.reply_to_message.from_user:
+        u = m.reply_to_message.from_user
+        return u.id, (u.full_name or u.first_name), u.username
+
+    # 2) text_mention
+    if m.entities:
+        for ent in m.entities:
+            if ent.type == "text_mention" and ent.user:
+                u = ent.user
+                return u.id, (u.full_name or u.first_name), u.username
+
+    # 3) @username из текста
+    if m.entities:
+        for ent in m.entities:
+            if ent.type == "mention":
+                uname = (m.text or "")[ent.offset+1: ent.offset+ent.length]  # без @
+                row = db_query("SELECT user_id, display_name, username FROM users WHERE LOWER(username)=LOWER(?) LIMIT 1;", (uname,))
+                if row:
+                    uid, dname, un = row[0]
+                    return uid, dname, un
+                return None, None, uname  # username есть, id не нашли (старые сообщения могли быть без user_id)
+
+    return None, None, None
 
 # =========================
 # OpenRouter
@@ -341,62 +392,84 @@ async def cmd_summary(m: Message, command: CommandObject):
 # =========================
 # Search in chat (simple RU time hints)
 # =========================
-@dp.message(Command("lord_search"))
-async def cmd_search(m: Message, command: CommandObject):
-    q = (command.args or "").strip()
-    if not q:
-        await m.reply("Формат: <code>/lord_search печеньки в про...шлом месяце</code> или <code>/lord_search дедлайн вчера</code>")
+
+@dp.message(Command("lord_psych"))
+async def cmd_lord_psych(m: Message, command: CommandObject):
+    """
+    Использование:
+      • Ответь командой на сообщение пользователя:   (reply) /lord_psych
+      • Или укажи @username в команде:               /lord_psych @nikki
+    """
+    target_id, display_name, uname = await resolve_target_user(m)
+    if not target_id and not uname:
+        await m.reply("Кого анализируем? Ответь командой на сообщение пользователя или укажи @username.")
         return
 
-    def parse_time_hint_ru(q: str):
-        ql = q.lower()
-        ref = datetime.now(timezone.utc)
-        if "вчера" in ql:
-            start = datetime(ref.year, ref.month, ref.day, tzinfo=timezone.utc) - timedelta(days=1)
-            end = start + timedelta(days=1)
-            return int(start.timestamp()), int(end.timestamp())
-        if "сегодня" in ql:
-            start = datetime(ref.year, ref.month, ref.day, tzinfo=timezone.utc)
-            end = start + timedelta(days=1)
-            return int(start.timestamp()), int(end.timestamp())
-        if "прошлой неделе" in ql or "прошлая неделя" in ql or "на прошлой неделе" in ql:
-            end = ref - timedelta(days=7)
-            start = end - timedelta(days=7)
-            return int(start.timestamp()), int(end.timestamp())
-        if "прошлом месяце" in ql or "прошлый месяц" in ql:
-            y, m = ref.year, ref.month
-            y2, m2 = (y - 1, 12) if m == 1 else (y, m - 1)
-            start = datetime(y2, m2, 1, tzinfo=timezone.utc)
-            end = datetime(y2 + 1, 1, 1, tzinfo=timezone.utc) if m2 == 12 else datetime(y2, m2 + 1, 1, tzinfo=timezone.utc)
-            return int(start.timestamp()), int(end.timestamp())
-        if "неделю" in ql or "7 дней" in ql:
-            start = ref - timedelta(days=7)
-            end = ref
-            return int(start.timestamp()), int(end.timestamp())
-        if "месяц" in ql:
-            start = ref - timedelta(days=30)
-            end = ref
-            return int(start.timestamp()), int(end.timestamp())
-        return None
-
-    tf = parse_time_hint_ru(q)
-    params = [m.chat.id]
-    sql = "SELECT username, text, message_id, created_at FROM messages WHERE chat_id=?"
-    if tf:
-        sql += " AND created_at BETWEEN ? AND ?"
-        params.extend([tf[0], tf[1]])
-    sql += " ORDER BY id DESC LIMIT 50;"
-    rows = db_query(sql, tuple(params))
+    # собираем корпус сообщений
+    rows = get_user_messages(m.chat.id, target_id, uname, limit=600)
     if not rows:
-        await m.reply("Ничего не нашлось.")
+        hint = "Нет сообщений в базе по этому пользователю."
+        if uname and not target_id:
+            hint += " Возможно, у этого @username нет сохранённого user_id (старые сообщения)."
+        await m.reply(hint)
         return
-    lines = []
-    for u, t, mid, ts in rows:
-        when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-        link = tg_link(m.chat.id, mid) if mid else ""
-        who = "@" + u if u else "user"
-        lines.append(f"• {when} — {who}: {t}" + (f" [<a href='{link}'>перейти</a>]" if link else ""))
-    await m.reply("\n".join(lines))
+
+    # формируем выборку: короткие цитаты + длинный контекст
+    # берём до 200 свежих сообщений; для цитат — 10–20 реплик по 200 символов
+    texts = [t for (t, mid, ts) in rows]
+    # оставим только печатные символы
+    def clean(s): 
+        return re.sub(r"\s+", " ", (s or "")).strip()
+    snippets = []
+    for t, mid, ts in rows[:200]:
+        t = clean(t)
+        if 8 <= len(t) <= 200:
+            link = tg_link(m.chat.id, mid) if mid else ""
+            # добавим якорь [link: ...] — позже превратим в встроенную ссылку
+            snippets.append(f"• {t}" + (f" [link: {link}]" if link else ""))
+    snippets = snippets[:20] if len(snippets) > 20 else snippets
+
+    # длинный контекст ограничим по символам
+    joined = " \n".join(clean(t) for t in texts[:500])
+    if len(joined) > 8000:
+        joined = joined[:8000]
+
+    # кликабельное имя
+    dname = display_name or uname or "участник"
+    target_html = tg_mention(target_id or 0, dname, uname)
+
+    system = (
+        "Ты пишешь НЕклинический психологический профиль на основе текстов человека в чате. "
+        "Это аналитическая заметка по стилю общения, мотивации и рискам. "
+        "Строго избегай клинических диагнозов и упоминаний чувствительных признаков (религия, политика, здоровье, интим). "
+        "Стиль — ясный и профессиональный; допускается ироничная сухость, но без оскорблений."
+    )
+
+    user = (
+        f"Цель анализа: {target_html}\n"
+        f"Контекст (фрагменты сообщений, новые → старые):\n{joined}\n\n"
+        "Короткие цитаты-показатели (если есть ссылки — интегрируй в текст, не отдельным словом «Источник»):\n"
+        + ("\n".join(snippets) if snippets else "—") +
+        "\n\nСформируй HTML-ответ в структуре:\n"
+        "<b>Психологический портрет</b> — по имени цели.\n"
+        "1) <b>Ключевые черты</b> — 5–8 пунктов, по 1–2 строки.\n"
+        "2) <b>Коммуникационный стиль</b> — 3–5 предложений.\n"
+        "3) <b>Мотиваторы</b> — 3–5 пунктов.\n"
+        "4) <b>Слепые зоны и риски</b> — 3–5 пунктов.\n"
+        "5) <b>Рекомендации по общению с ним в чате</b> — 4–6 чётких советов.\n"
+        "6) <b>Цитаты-показатели</b> — 3–5 очень коротких цитат (8–120 знаков), в каждой встрой 1 ссылку на сообщение, "
+        "используя якорь на 2–5 слов из цитаты (URL бери из [link: ...]).\n"
+        "7) <b>Личное мнение Лорда</b> — 1–2 фразы, аккуратно, без грубостей.\n"
+        "Не используй клиника-термины, не приписывай диагнозы, не трогай чувствительные темы."
+    )
+
+    try:
+        reply = await ai_reply(system, user, temperature=0.35)
+        reply = smart_linkify(reply)
+        await m.reply(sanitize_html_whitelist(reply))
+    except Exception as e:
+        await m.reply(f"Портрет временно недоступен: {e}")
+
 
 # =========================
 # Small talk / interjections
@@ -584,11 +657,11 @@ async def on_text(m: Message):
 async def set_commands():
     commands_group = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
-        BotCommand(command="lord_search", description="Поиск по чату"),
+        BotCommand(command="lord_psych",  description="Психологический портрет участника"),  # ← добавили
     ]
     commands_private = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
-        BotCommand(command="lord_search", description="Поиск по чату"),
+        BotCommand(command="lord_psych",  description="Психологический портрет участника"),  # ← добавили
         BotCommand(command="start", description="Приветствие"),
     ]
     await bot.set_my_commands(commands_group, scope=BotCommandScopeAllGroupChats())
