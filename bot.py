@@ -496,7 +496,7 @@ EPITHETS = [
     "слов много, смысл — турист без визы",
 ]
 
-def maybe_pick_epithet(p: float = 0.2, min_gap: int = 8) -> str | None:
+def maybe_pick_epithet(p: float = 0.2, min_gap: int = 20) -> str | None:
     if random.random() > p:
         return None
     return random.choice(EPITHETS)
@@ -517,7 +517,7 @@ async def reply_to_mention(m: Message):
     system = persona_prompt_natural()
     user = (
         "Тебя упомянули в групповом чате. Ответь коротко, по существу и с холодной вежливостью. "
-        "Допускается одна колкость или саркастичная ремарка."
+        "Допускается одна колкость или саркастичная ремарка. Допускается лаконичная нецензурная брань. "
         + add +
         f"\n\nНедавний контекст:\n{ctx}\n\nСообщение:\n«{m.text}»"
     )
