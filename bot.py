@@ -37,10 +37,6 @@ OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "https://example.com")
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "lord-verbus")
 MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-nemo")
 
-print("[ENV] BOT_TOKEN:", bool(BOT_TOKEN))
-print("[ENV] OPENROUTER_API_KEY:", bool(OPENROUTER_API_KEY))
-print("[ENV] OPENROUTER_MODEL:", MODEL)
-
 if not BOT_TOKEN or not OPENROUTER_API_KEY:
     raise SystemExit("[Lord Verbus] Missing envs: BOT_TOKEN or OPENROUTER_API_KEY")
 
@@ -85,14 +81,6 @@ def init_db():
             created_at INTEGER NOT NULL
         );
         """)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS auto_reply_stats (
-            chat_id INTEGER PRIMARY KEY,
-            last_reply_ts INTEGER DEFAULT 0,
-            window_start_ts INTEGER DEFAULT 0,
-            replies_in_window INTEGER DEFAULT 0
-        );
-        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages(chat_id, created_at);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_msgid ON messages(chat_id, message_id);")
         conn.commit()
@@ -123,8 +111,6 @@ QUESTION_RE = re.compile("|".join(QUESTION_PATTERNS), re.IGNORECASE)
 
 def is_question(text: str) -> bool:
     if not text: return False
-    if len(text) < 4096 and len(re.findall(r"https?://\S+", text)) > 2:
-        return False
     return bool(QUESTION_RE.search(text))
 
 def mentions_bot(text: str, bot_username: str | None) -> bool:
@@ -133,11 +119,6 @@ def mentions_bot(text: str, bot_username: str | None) -> bool:
 
 def is_quiet_hours(local_dt: datetime) -> bool:
     return 0 <= local_dt.hour < 7  # 00:00–07:00
-
-def tg_link(chat_id: int, message_id: int) -> str:
-    s = str(chat_id)
-    cid = s[4:] if s.startswith("-100") else s.lstrip("-")
-    return f"https://t.me/c/{cid}/{message_id}"
 
 def sanitize_html_whitelist(text: str) -> str:
     esc = _html.escape(text)
@@ -148,38 +129,18 @@ def sanitize_html_whitelist(text: str) -> str:
     esc = esc.replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
     return esc
 
-def recent_chat_activity(chat_id: int, minutes: int) -> int:
-    since = now_ts() - minutes * 60
-    row = db_query("SELECT COUNT(*) FROM messages WHERE chat_id=? AND created_at>?", (chat_id, since))
-    return row[0][0] if row else 0
-
-def chat_recent_context(chat_id: int, limit: int = 30):
-    rows = db_query(
-        "SELECT username, text FROM messages WHERE chat_id=? AND text IS NOT NULL ORDER BY id DESC LIMIT ?;",
-        (chat_id, limit)
-    )
-    return list(reversed(rows))
-
-# ----- rare epithets (reduced frequency)
+# ----- very rare epithets
 EPITHETS = [
     "к лешему", "к дьяволу", "к демонам", "будь он неладен", "будь оно проклято",
-    "святая бессмыслица", "адская путаница", "мерзкая чепуха", "вот же напасть", "вот беда",
-    "ни в какие ворота", "за гранью приличий", "бездна нелепости", "какого лешего",
-    "голая софистика", "жалкая эквилибристика", "буря в стакане", "уродливый компромисс",
-    "интеллектуальный бардак", "риторический мусор", "кособокая логика", "приторная наивность",
-    "зудящая банальщина", "гниль рассуждений", "срамная мешанина", "смех и грех",
-    "позор дедукции", "пыль в глаза", "сиропная банальность", "карнавал нелепости",
-    "цирк без клоунов", "срамота логики", "грош цена аргументу", "та ещё катастрофа",
-    "позорная муштра фактов", "зазеркальная нелепость", "свинцовая тупость идеи",
-    "непрошеная чепуха", "жеваная банальщина", "бурлеск нелепости", "кислый софизм",
-    "тоскливая демагогия", "мысленный хаос", "словесный дым", "скверный аргумент",
-    "слепая уверенность", "упрямая нелепость", "грязная логическая каша", "нафталиновая мудрость"
+    "святая бессмыслица", "адская путаница", "мерзкая чепуха", "вот же напасть",
+    "ни в какие ворота", "бездна нелепости", "какого лешего", "голая софистика",
+    "буря в стакане", "уродливый компромисс", "интеллектуальный бардак",
+    "риторический мусор", "кособокая логика", "зудящая банальщина",
 ]
 _last_epithet = None
-replies_since_epithet = 0  # кулдаун по количеству ответов
+replies_since_epithet = 0  # не чаще одного на 5 ответов
 
-def maybe_pick_epithet(p: float = 0.18, min_gap: int = 4) -> str | None:
-    """Редко и не чаще одного раза на min_gap ответов."""
+def maybe_pick_epithet(p: float = 0.12, min_gap: int = 5) -> str | None:
     global _last_epithet, replies_since_epithet
     if replies_since_epithet < min_gap:
         return None
@@ -198,14 +159,16 @@ def bump_reply_counter():
 def persona_prompt() -> str:
     return (
         "Ты — «Лорд Вербус»: аристократичный, язвительно-умный компаньон в духе Холмса (Downey Jr.). "
-        "Пиши кратко. Сначала — СУТЬ/ОТВЕТ, затем — одна короткая колкость. "
-        "Если ответа нет, скажи честно одним предложением и намекни, что нужно уточнить. "
-        "Используй редкие изящные ругательства на ОБСТОЯТЕЛЬСТВА (не на людей) и не чаще одного за ответ, да и то редко. "
-        "Не обращайся по имени и не используй @."
+        "Пиши кратко. Если в сообщении есть вопрос — СНАЧАЛА дай конкретный короткий ответ (1 фраза), "
+        "ПОТОМ можно добавить вторую фразу — лёгкую язвительную ремарку. "
+        "Если точного ответа нет — честно скажи 1 фразой, что не хватает данных. "
+        "Изящные ругательства (на обстоятельства) используй редко, не чаще одного и только если уместно. "
+        "Не обращайся к собеседнику по имени и не используй @. "
+        "НЕ ПИШИ слова «Ответ:» или «Колкость:» и не ставь маркировок частей."
     )
 
 # ---------------- OpenRouter ----------------
-async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.7):
+async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.68):
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -251,13 +214,17 @@ async def setup_commands():
     await bot.set_my_commands(base_cmds, scope=BotCommandScopeAllPrivateChats())
 
 # ---------- SUMMARY ----------
+def tg_link(chat_id: int, message_id: int) -> str:
+    s = str(chat_id)
+    cid = s[4:] if s.startswith("-100") else s.lstrip("-")
+    return f"https://t.me/c/{cid}/{message_id}"
+
 def prev_summary_link(chat_id: int):
     prev = db_query("SELECT message_id FROM last_summary WHERE chat_id=?;", (chat_id,))
     return tg_link(chat_id, prev[0][0]) if prev and prev[0][0] else None
 
 @dp.message(Command("lord_summary"))
 async def cmd_summary(m: Message, command: CommandObject):
-    # саммари всегда предпочтительно над «остроумным ответом»
     try:
         n = int((command.args or "").strip())
         n = max(50, min(800, n))
@@ -298,7 +265,7 @@ async def cmd_summary(m: Message, command: CommandObject):
         "2–3 коротких предложения, обобщающих разговор. БЕЗ ссылок.\n\n"
         "Далее СТРОГО 2–4 тематических блока. Каждый блок РОВНО так:\n"
         "😄 <b>Короткое название темы</b>\n"
-        "Короткий абзац (1–3 предложения) без дословных цитат, без списков. "
+        "Короткий абзац (1–3 предложения) без списков. "
         "Внутри абзаца используй 1–3 встроенных гиперссылки <a href='URL'>…</a> на сообщения из входных данных "
         "(URL бери из соответствующих [link: URL]). Никого по имени не упоминай, не используй @.\n\n"
         "Заверши одной фразой от Лорда Вербуса — язвительно-умной; изящные восклицания допускаются редко."
@@ -399,24 +366,49 @@ async def cmd_search(m: Message, command: CommandObject):
     await m.reply("Нашёл:\n" + "\n".join(lines))
 
 # ---------- Dialog logic ----------
-
 async def reply_to_mention(m: Message):
     if is_quiet_hours(datetime.now().astimezone()):
         return
-    ctx = chat_recent_context(m.chat.id, limit=15)
-    lines = [(("@" + u) if u else "user") + ": " + t for u, t in ctx]
-    ctx_block = "\n".join(lines)
+    # контекст на случай многоходовки
+    rows = db_query(
+        "SELECT username, text FROM messages WHERE chat_id=? AND text IS NOT NULL ORDER BY id DESC LIMIT 15;",
+        (m.chat.id,)
+    )
+    ctx_block = "\n".join([((('@'+u) if u else 'user') + ': ' + t) for u, t in reversed(rows)])
 
     epithet = maybe_pick_epithet()
-    add = f"\nЕсли уместно, можно вставить ровно одно выражение (используй редко): «{epithet}»." if epithet else ""
+    add = f"\nМожно вставить одно редкое изящное выражение, если уместно: «{epithet}»." if epithet else ""
     system = persona_prompt()
     user = (
-        "Тебя упомянули в групповом чате.\n"
-        "Правило: СНАЧАЛА дай ПРЯМОЙ КОРОТКИЙ ОТВЕТ по сути вопроса/реплики (1 фраза), "
-        "ПОТОМ — одна короткая колкость.\n"
-        "Если прямого ответа нет — скажи кратко, чего не хватает для ответа." + add +
-        f"\n\nНедавний контекст:\n{ctx_block}\n\n"
-        f"Сообщение:\n«{m.text}»"
+        "Тебя упомянули в групповом чате."
+        " Сначала дай прямой короткий ответ на вопрос/суть (если он есть),"
+        " затем добавь одну короткую язвительную фразу."
+        " Никаких пометок 'Ответ:' и 'Колкость:'." + add +
+        f"\n\nНедавний контекст:\n{ctx_block}\n\nСообщение:\n«{m.text}»"
+    )
+    try:
+        reply = await ai_reply(system, user, temperature=0.66)
+        await m.reply(sanitize_html_whitelist(reply))
+    finally:
+        bump_reply_counter()
+
+async def reply_to_thread(m: Message):
+    if is_quiet_hours(datetime.now().astimezone()):
+        return
+    rows = db_query(
+        "SELECT username, text FROM messages WHERE chat_id=? AND text IS NOT NULL ORDER BY id DESC LIMIT 15;",
+        (m.chat.id,)
+    )
+    ctx_block = "\n".join([((('@'+u) if u else 'user') + ': ' + t) for u, t in reversed(rows)])
+
+    epithet = maybe_pick_epithet()
+    add = f"\nМожно вставить одно редкое изящное выражение, если уместно: «{epithet}»." if epithet else ""
+    system = persona_prompt()
+    user = (
+        "Пользователь ответил реплаем на твоё сообщение."
+        " Сначала дай прямой короткий ответ (если вопрос есть), затем одна короткая язвительная фраза."
+        " Никаких пометок 'Ответ:' и 'Колкость:'." + add +
+        f"\n\nНедавний контекст:\n{ctx_block}\n\nРеплай:\n«{m.text}»"
     )
     try:
         reply = await ai_reply(system, user, temperature=0.68)
@@ -424,80 +416,18 @@ async def reply_to_mention(m: Message):
     finally:
         bump_reply_counter()
 
-async def reply_to_thread(m: Message):
-    """Отвечаем, когда пользователь ответил реплаем на сообщение бота.
-       Без троттлинга: отвечаем стабильно (кроме тихих часов)."""
-    if is_quiet_hours(datetime.now().astimezone()):
-        return
-
-    ctx = chat_recent_context(m.chat.id, limit=15)
-    lines = [(("@" + u) if u else "user") + ": " + t for u, t in ctx]
-    ctx_block = "\n".join(lines)
-
-    epithet = maybe_pick_epithet()
-    add = f"\nЕсли уместно, можно вставить ровно одно выражение (используй редко): «{epithet}»." if epithet else ""
-    system = persona_prompt()
-    user = (
-        "Пользователь ответил реплаем на твоё сообщение.\n"
-        "Правило: СНАЧАЛА дай ПРЯМОЙ КОРОТКИЙ ОТВЕТ (1 фраза), ПОТОМ — одна короткая колкость.\n"
-        "Если ответ невозможен — кратко укажи, чего не хватает." + add +
-        f"\n\nНедавний контекст:\n{ctx_block}\n\n"
-        f"Реплай:\n«{m.text}»"
-    )
-    try:
-        reply = await ai_reply(system, user, temperature=0.7)
-        await m.reply(sanitize_html_whitelist(reply))
-    finally:
-        bump_reply_counter()
-
-async def maybe_reply(m: Message):
-    """Уместное вмешательство — только на вопросы, при заметной активности."""
-    if not m.chat or not m.from_user or not m.text:
-        return
-    me = await bot.get_me()
-    if m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id:
-        return
-    if mentions_bot(m.text, me.username):
-        return
-    if not is_question(m.text):
-        return
-    if recent_chat_activity(m.chat.id, minutes=5) < 5:
-        return
-    if is_quiet_hours(datetime.now().astimezone()):
-        return
-
-    ctx = chat_recent_context(m.chat.id, limit=20)
-    lines = [(("@" + u) if u else "user") + ": " + t for u, t in ctx]
-    ctx_block = "\n".join(lines[-20:])
-
-    epithet = maybe_pick_epithet()
-    add = f"\nЕсли уместно, можно вставить одно выражение (редко): «{epithet}»." if epithet else ""
-    system = persona_prompt()
-    user = (
-        "Это фрагмент недавнего группового чата. Тебе задали вопрос (или близко к тому).\n"
-        "Правило: СНАЧАЛА дай ПРЯМОЙ КОРОТКИЙ ОТВЕТ (1 фраза), ПОТОМ — одна короткая колкость. "
-        "Если ответ невозможен — кратко объясни, чего не хватает." + add +
-        f"\n\nКонтекст:\n{ctx_block}\n\nВопрос:\n«{m.text}»"
-    )
-    try:
-        reply = await ai_reply(system, user, temperature=0.72)
-        await m.reply(sanitize_html_whitelist(reply))
-    finally:
-        bump_reply_counter()
-
 # ---------- Base handlers ----------
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
-    await m.reply("Лорд Вербус к вашим услугам. Команды: /ping, /lord_summary, /lord_search <запрос>")
+    await m.reply("Лорд Вербус к вашим услугам. Команды: /ping, /lord_summary [N], /lord_search <запрос>")
 
 @dp.message(Command("ping"))
 async def cmd_ping(m: Message):
     await m.reply("pong")
 
-# ВАЖНО: общий ловец **не мешает** командам
 @dp.message(F.text)
 async def catcher(m: Message):
-    # логируем только не-команды
+    # логируем не-команды
     if not m.text.startswith("/"):
         db_execute(
             "INSERT INTO messages(chat_id, user_id, username, text, created_at, message_id) VALUES (?, ?, ?, ?, ?, ?);",
@@ -508,28 +438,27 @@ async def catcher(m: Message):
 
     me = await bot.get_me()
 
-    # если это КОМАНДА — вообще ничего не делаем здесь (пусть обработают command-хендлеры)
+    # команды обрабатывают свои хендлеры — здесь игнорируем
     if m.text.startswith("/"):
         return
 
-    # если ответили на бота — отвечаем
+    # отвечаем, если:
+    # 1) реплай на бота
     if m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id:
         await reply_to_thread(m)
         return
 
-    # если упомянули бота — отвечаем
+    # 2) упомянули по @
     if mentions_bot(m.text or "", me.username):
         await reply_to_mention(m)
         return
 
-    # иначе — уместное вмешательство (только на вопросы)
-    await maybe_reply(m)
+    # иначе — молчим (никакого автозадирания на любые вопросы)
 
 # ---------------- Main ----------------
 async def main():
     init_db()
     await setup_commands()
-    print("[Lord Verbus] Online ✅ Starting long polling…")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
