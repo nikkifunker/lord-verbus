@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import html as _html
 import re as _re
 import os, pathlib
+import json
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -109,7 +110,6 @@ def get_user_messages(chat_id: int, user_id: int | None, username: str | None, l
         )
     return []
 
-
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
@@ -155,6 +155,35 @@ def sanitize_html_whitelist(text: str) -> str:
     ), text)
     return text
 
+def remove_unbalanced_tags(text: str) -> str:
+    for tag in ("b","i","u","s","del","code","pre","a","span"):
+        open_n = len(re.findall(fr"<{tag}\b[^>]*>", text, flags=re.IGNORECASE))
+        close_n = len(re.findall(fr"</{tag}>", text, flags=re.IGNORECASE))
+        if close_n > open_n:
+            for _ in range(close_n - open_n):
+                text = re.sub(fr"</{tag}>(?!.*</{tag}>)", "", text, flags=re.IGNORECASE)
+    return text
+
+MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)")
+EXTRA_CLOSE_A_RE = re.compile(r"</a>\s*</a>", re.IGNORECASE)
+
+def normalize_for_telegram(text: str) -> str:
+    if not text:
+        return text
+    t = text
+    # минимальная поддержка markdown
+    t = MD_BOLD_RE.sub(r"<b>\1</b>", t)
+    t = MD_ITALIC_RE.sub(r"<i>\1</i>", t)
+    # приведение ошибок разметки
+    t = t.replace("</br>", "<br>").replace("<br/>", "<br>")
+    t = EXTRA_CLOSE_A_RE.sub("</a>", t)
+    # убрать пустые и вложенные <a>
+    t = re.sub(r'<a\s+href="[^"]*">\s*</a>', "", t, flags=re.IGNORECASE)
+    t = re.sub(r'<a\s+href="[^"]*">\s*<a\s+href="', '<a href="', t, flags=re.IGNORECASE)
+    t = re.sub(r'</a>\s*</a>', '</a>', t, flags=re.IGNORECASE)
+    return t
+
 def strip_outer_quotes(s: str) -> str:
     t = s.strip()
     if (t.startswith("«") and t.endswith("»")) or (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
@@ -183,35 +212,23 @@ def tg_mention(user_id: int, display_name: str | None, username: str | None) -> 
 
 # ---- target user resolver (по reply, text_mention или @username)
 async def resolve_target_user(m: Message) -> tuple[int | None, str | None, str | None]:
-    """
-    Возвращает (user_id, display_name, username) для цели анализа:
-    - если команда дана в reply — берём автора исходного сообщения
-    - если есть text_mention — берём user.id
-    - если есть @username — пытаемся найти user_id в таблице users
-    """
-    # 1) reply
     if m.reply_to_message and m.reply_to_message.from_user:
         u = m.reply_to_message.from_user
         return u.id, (u.full_name or u.first_name), u.username
-
-    # 2) text_mention
     if m.entities:
         for ent in m.entities:
             if ent.type == "text_mention" and ent.user:
                 u = ent.user
                 return u.id, (u.full_name or u.first_name), u.username
-
-    # 3) @username из текста
     if m.entities:
         for ent in m.entities:
             if ent.type == "mention":
-                uname = (m.text or "")[ent.offset+1: ent.offset+ent.length]  # без @
+                uname = (m.text or "")[ent.offset+1: ent.offset+ent.length]
                 row = db_query("SELECT user_id, display_name, username FROM users WHERE LOWER(username)=LOWER(?) LIMIT 1;", (uname,))
                 if row:
                     uid, dname, un = row[0]
                     return uid, dname, un
-                return None, None, uname  # username есть, id не нашли (старые сообщения могли быть без user_id)
-
+                return None, None, uname
     return None, None, None
 
 # =========================
@@ -242,10 +259,9 @@ async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.
 # Linkify helpers
 # =========================
 LINK_PAT = re.compile(r"\[link:\s*(https?://[^\]\s]+)\s*\]")
-ANCHOR_PAT = re.compile(r"<a\s+href=['\"](https?://[^'\"]+)['\"]\s*>Источник</a>", re.IGNORECASE)
+ANCHOR_PAT = re.compile(r"<a\s+href=\"(https?://[^\"]+)\"\s*>Источник</a>", re.IGNORECASE)
 
 def _wrap_last_words(text: str, url: str, min_w: int = 2, max_w: int = 5) -> str:
-    # привяжем ссылку к последним 2–5 словам слева
     parts = re.split(r"(\s+)", text)
     words = []
     for i in range(len(parts)-1, -1, -1):
@@ -259,7 +275,6 @@ def _wrap_last_words(text: str, url: str, min_w: int = 2, max_w: int = 5) -> str
     if len(wonly) < min_w:
         return text
     k = min(len(wonly), max_w)
-    # склеиваем: берем последние k «словенных» токенов
     counter = 0
     left_safe = ""
     for t in reversed(tokens):
@@ -271,29 +286,20 @@ def _wrap_last_words(text: str, url: str, min_w: int = 2, max_w: int = 5) -> str
     left_final = left_safe.rstrip()
     if left != left_safe:
         left_final += left[len(left_safe):]
-    return left_final + f" <a href='{url}'>" + right[len(left_final):] + "</a>"
+    return left_final + f' <a href="{url}">' + right[len(left_final):] + "</a>"
 
 def smart_linkify(text: str) -> str:
-    """
-    1) [link: URL] → встроенная ссылка на предыдущие 2–5 слов
-    2) <a href='...'>Источник</a> → тоже превращаем в ссылку на предыдущие 2–5 слов
-    """
-    # шаг 1 — обрабатываем все [link: ...]
-    urls = LINK_PAT.findall(text)
+    urls = LINK_PAT.findall(text or "")
     for url in urls:
         text = _wrap_last_words(text, url)
-
-    # шаг 2 — если модель всё равно выводит «Источник» якорёк
     for m in list(ANCHOR_PAT.finditer(text)):
         url = m.group(1)
         start, end = m.span()
         left = text[:start]
         right = text[end:]
-        # пытаемся привязать к предыдущим словам
         tmp = left + f"[link: {url}]" + right
         text = _wrap_last_words(tmp, url)
-    # на всякий случай — уберём остаточные [link: ...], если вдруг остались
-    text = LINK_PAT.sub(lambda mm: f"<a href='{mm.group(1)}'>ссылка</a>", text)
+    text = LINK_PAT.sub(lambda mm: f'<a href="{mm.group(1)}">ссылка</a>', text)
     return text
 
 # =========================
@@ -323,7 +329,6 @@ async def cmd_summary(m: Message, command: CommandObject):
     prev_link = prev_summary_link(m.chat.id)
     prev_line_html = f'<a href="{prev_link}">Предыдущий анализ</a>' if prev_link else "Предыдущий анализ (—)"
 
-    # Собираем участников и превращаем в кликабельные имена
     user_ids = tuple({r[0] for r in rows})
     users_map = {}
     if user_ids:
@@ -376,13 +381,14 @@ async def cmd_summary(m: Message, command: CommandObject):
 
     try:
         reply = await ai_reply(system, user, temperature=0.2)
-        # 1) Умная автолинковка: [link: URL] → якорь на предшествующие слова
         reply = smart_linkify(reply)
+        reply = normalize_for_telegram(reply)
+        safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
+        sent = await m.reply(safe)
     except Exception as e:
-        reply = f"Суммаризация временно недоступна: {e}"
+        fallback = _html.escape(strip_outer_quotes(str(e)))
+        sent = await m.reply(f"Суммаризация временно недоступна: {fallback}")
 
-    safe = sanitize_html_whitelist(reply)
-    sent = await m.reply(safe)
     db_execute(
         "INSERT INTO last_summary(chat_id, message_id, created_at) VALUES (?, ?, ?)"
         "ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id, created_at=excluded.created_at;",
@@ -390,22 +396,18 @@ async def cmd_summary(m: Message, command: CommandObject):
     )
 
 # =========================
-# Search in chat (simple RU time hints)
+# Психологический портрет
 # =========================
-
 @dp.message(Command("lord_psych"))
 async def cmd_lord_psych(m: Message, command: CommandObject):
     """
-    Использование:
-      • Ответь командой на сообщение пользователя:   (reply) /lord_psych
-      • Или укажи @username в команде:               /lord_psych @nikki
+    /lord_psych — в reply к пользователю или /lord_psych @username
     """
     target_id, display_name, uname = await resolve_target_user(m)
     if not target_id and not uname:
         await m.reply("Кого анализируем? Ответь командой на сообщение пользователя или укажи @username.")
         return
 
-    # собираем корпус сообщений
     rows = get_user_messages(m.chat.id, target_id, uname, limit=600)
     if not rows:
         hint = "Нет сообщений в базе по этому пользователю."
@@ -414,10 +416,7 @@ async def cmd_lord_psych(m: Message, command: CommandObject):
         await m.reply(hint)
         return
 
-    # формируем выборку: короткие цитаты + длинный контекст
-    # берём до 200 свежих сообщений; для цитат — 10–20 реплик по 200 символов
     texts = [t for (t, mid, ts) in rows]
-    # оставим только печатные символы
     def clean(s): 
         return re.sub(r"\s+", " ", (s or "")).strip()
     snippets = []
@@ -425,16 +424,13 @@ async def cmd_lord_psych(m: Message, command: CommandObject):
         t = clean(t)
         if 8 <= len(t) <= 200:
             link = tg_link(m.chat.id, mid) if mid else ""
-            # добавим якорь [link: ...] — позже превратим в встроенную ссылку
             snippets.append(f"• {t}" + (f" [link: {link}]" if link else ""))
     snippets = snippets[:20] if len(snippets) > 20 else snippets
 
-    # длинный контекст ограничим по символам
     joined = " \n".join(clean(t) for t in texts[:500])
     if len(joined) > 8000:
         joined = joined[:8000]
 
-    # кликабельное имя
     dname = display_name or uname or "участник"
     target_html = tg_mention(target_id or 0, dname, uname)
 
@@ -468,10 +464,12 @@ async def cmd_lord_psych(m: Message, command: CommandObject):
     try:
         reply = await ai_reply(system, user, temperature=0.55)
         reply = smart_linkify(reply)
-        await m.reply(sanitize_html_whitelist(reply))
+        reply = normalize_for_telegram(reply)
+        safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
+        await m.reply(safe)
     except Exception as e:
-        await m.reply(f"Портрет временно недоступен: {e}")
-
+        fallback = _html.escape(strip_outer_quotes(str(e)))
+        await m.reply(f"Портрет временно недоступен: {fallback}")
 
 # =========================
 # Small talk / interjections
@@ -524,12 +522,10 @@ EPITHETS = [
     "слов много, смысл — турист без визы",
 ]
 
-
 def maybe_pick_epithet(p: float = 0.2, min_gap: int = 8) -> str | None:
     if random.random() > p:
         return None
     return random.choice(EPITHETS)
-
 
 REPLY_COUNTER = 0
 def bump_reply_counter():
@@ -554,7 +550,9 @@ async def reply_to_mention(m: Message):
     try:
         reply = await ai_reply(system, user, temperature=0.66)
         reply = strip_outer_quotes(reply)
-        await m.reply(sanitize_html_whitelist(reply))
+        reply = normalize_for_telegram(reply)
+        safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
+        await m.reply(safe)
     finally:
         bump_reply_counter()
 
@@ -575,10 +573,11 @@ async def reply_to_thread(m: Message):
     )
     reply = await ai_reply(system, user, temperature=0.66)
     reply = strip_outer_quotes(reply)
-    await m.reply(sanitize_html_whitelist(reply))
+    reply = normalize_for_telegram(reply)
+    safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
+    await m.reply(safe)
 
 async def maybe_interject(m: Message):
-    # вмешиваемся иногда, если явный вопрос и не «тихий час»
     local_dt = datetime.now()
     if is_quiet_hours(local_dt): return
     if not is_question(m.text or ""): return
@@ -600,7 +599,9 @@ async def maybe_interject(m: Message):
     try:
         reply = await ai_reply(system, user, temperature=0.66)
         reply = strip_outer_quotes(reply)
-        await m.reply(sanitize_html_whitelist(reply))
+        reply = normalize_for_telegram(reply)
+        safe = remove_unbalanced_tags(sanitize_html_whitelist(reply))
+        await m.reply(safe)
     finally:
         bump_reply_counter()
 
@@ -612,7 +613,7 @@ async def start(m: Message):
     await m.reply(
         "Я — Лорд Вербус. Команды:\n"
         "• /lord_summary — краткий отчёт по беседе\n"
-        "• /lord_search <запрос> — поиск по чату (поддержка: «вчера», «сегодня», «прошлой неделе», «прошлом месяце», «неделю», «месяц»)\n"
+        "• /lord_psych — психологический портрет участника (ответь на его сообщение или укажи @username)\n"
         "Просто говорите — я вмешаюсь, если нужно."
     )
 
@@ -621,7 +622,6 @@ async def on_text(m: Message):
     if not m.text:
         return
 
-    # логируем текст
     if not m.text.startswith("/"):
         db_execute(
             "INSERT INTO messages(chat_id, user_id, username, text, created_at, message_id) VALUES (?, ?, ?, ?, ?, ?);",
@@ -629,7 +629,6 @@ async def on_text(m: Message):
              m.from_user.username if m.from_user else None,
              m.text, now_ts(), m.message_id)
         )
-        # — обновляем карточку пользователя (для кликабельных имён в саммари)
         if m.from_user:
             full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
             db_execute(
@@ -659,11 +658,11 @@ async def on_text(m: Message):
 async def set_commands():
     commands_group = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
-        BotCommand(command="lord_psych",  description="Психологический портрет участника"),  # ← добавили
+        BotCommand(command="lord_psych",  description="Психологический портрет участника"),
     ]
     commands_private = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
-        BotCommand(command="lord_psych",  description="Психологический портрет участника"),  # ← добавили
+        BotCommand(command="lord_psych",  description="Психологический портрет участника"),
         BotCommand(command="start", description="Приветствие"),
     ]
     await bot.set_my_commands(commands_group, scope=BotCommandScopeAllGroupChats())
