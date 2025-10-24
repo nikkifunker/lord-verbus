@@ -198,13 +198,47 @@ def bump_autoreply(chat_id: int, *, force_window_reset: bool = False):
         db_execute("UPDATE auto_reply_stats SET last_reply_ts=?, replies_in_window=? WHERE chat_id=?;",
                    (now, (cnt or 0) + 1, chat_id))
 
-# ---------- Persona ----------
+# ---------- Persona & Epithet Pool ----------
+EPITHETS = [
+    "к лешему", "к дьяволу", "к демонам", "будь он неладен", "будь оно проклято",
+    "чёрт возьми", "чёрт побери", "чёртова логика", "святая бессмыслица",
+    "адская путаница", "мерзкая чепуха", "вот же напасть", "вот беда",
+    "мать её синтаксическая бездна", "да чтоб тебя", "да чтоб оно",
+    "ни в какие ворота", "за гранью приличий", "бездна нелепости",
+    "какого лешего", "какого чёрта", "мне плевать на эту чепуху",
+    "голая софистика", "жалкая эквилибристика", "карнавал нелепости",
+    "юродивый алгоритм", "фарс из фарсов", "цирк без клоунов",
+    "срамота логики", "позор дедукции", "грош цена аргументу",
+    "бестолковая вакханалия", "позорная муштра фактов",
+    "скучная ересь", "буря в стакане", "срамная мешанина",
+    "та ещё катастрофа", "смех и грех", "уродливый компромисс",
+    "сиропная банальность", "зловонная демагогия", "пыль в глаза",
+    "интеллектуальный бардак", "риторический мусор", "сраная бага",
+    "кособокая логика", "приторная наивность", "зудящая банальщина",
+    "гниль рассуждений", "изношенная платitude", "зазеркальная нелепость"
+]
+_last_epithet: str | None = None
+
+def maybe_pick_epithet(p: float = 0.5) -> str | None:
+    """С шансом p вернёт изящное ругательство, избегая повтора подряд."""
+    global _last_epithet
+    if random.random() > p:
+        return None
+    pool = [e for e in EPITHETS if e != _last_epithet]
+    if not pool:
+        pool = EPITHETS[:]
+    choice = random.choice(pool)
+    _last_epithet = choice
+    return choice
+
 def persona_prompt() -> str:
     return (
         "Ты — «Лорд Вербус»: аристократичный, язвительно-умный компаньон в духе Холмса (Downey Jr.). "
-        "Стиль: сухое остроумие, дедуктивные подколы, тонкий троллинг; допустим изящный строгий мат по обстоятельствам "
-        "(«к чёрту», «чёрт побери», «какого лешего», «будь он неладен», «чёртова логика», «мерзкая хрень» и т.п.). "
-        "Людей НЕ оскорбляй, кличек и прямых атак на личность избегай. "
+        "Стиль: сухое остроумие, дедуктивные подколы, тонкий троллинг. "
+        "Допустим изящный, строгий мат — ругайся на ОБСТОЯТЕЛЬСТВА/идеи, а не на людей. "
+        "Примеры словаря (вариируй, не повторяйся подряд, используй не чаще одного за ответ): "
+        + ", ".join(f"«{e}»" for e in EPITHETS) + ". "
+        "Людей НЕ оскорбляй, ярлыков не вешай. "
         "Пиши 1–2 короткие фразы. Не обращайся к собеседнику по имени и не используй @-упоминания."
     )
 
@@ -244,7 +278,7 @@ async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ----- логируем любое текстовое сообщение
+# ----- логирование + маршрутизация реакций
 @dp.message(F.text)
 async def catcher(m: Message):
     # лог в БД (не пишем чистые команды)
@@ -262,17 +296,15 @@ async def catcher(m: Message):
         )
 
     me = await bot.get_me()
-    # 1) если это ответ НА СООБЩЕНИЕ БОТА — ответим в ветке
+    # 1) ответили на сообщение бота — отвечаем в ветке
     if m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id:
-        await reply_to_thread(m)  # новый хендлер
+        await reply_to_thread(m)
         return
-
-    # 2) если прямо УПОМИНАЮТ бота — ответим
+    # 2) упоминание бота — отвечаем
     if mentions_bot(m.text or "", me.username):
         await reply_to_mention(m)
         return
-
-    # 3) иначе — «умное вмешательство» по вопросу
+    # 3) иначе — «умное вмешательство» при вопросе
     if not m.text.startswith("/"):
         await maybe_reply(m)
 
@@ -334,8 +366,7 @@ async def cmd_summary(m: Message, command: CommandObject):
         "Короткий абзац (1–3 предложения) без дословных цитат, без списков и 'Ключевых моментов'. "
         "Внутри абзаца используй 1–3 встроенных гиперссылки <a href='URL'>…</a> на сообщения из входных данных "
         "(URL бери из соответствующих [link: URL]). Никого по имени не упоминай, не используй @.\n\n"
-        "Заверши одной фразой от Лорда Вербуса — язвительно-умной, можно изящный строгий мат по обстоятельствам, "
-        "но без оскорблений людей."
+        "Заверши одной фразой от Лорда Вербуса — язвительно-умной; допустим изящный строгий мат по обстоятельствам."
     )
 
     try:
@@ -443,24 +474,24 @@ async def reply_to_mention(m: Message):
         lines.append(f"{handle}: {t}")
     ctx_block = "\n".join(lines)
 
+    epithet = maybe_pick_epithet(0.66)  # чаще, чем 50%
     system = persona_prompt()
+    add = f"\nРазрешённое выражение для разнообразия (используй его максимум один раз и только если уместно): «{epithet}»." if epithet else ""
     user = (
         "Тебя упомянули в групповом чате. Ответь в своём стиле (1–2 фразы). "
         "Никого по имени не упоминай и не используй @. "
-        "Изящный строгий мат допустим по ОБСТОЯТЕЛЬСТВАМ, людей не оскорбляй.\n\n"
-        f"Недавний контекст:\n{ctx_block}\n\n"
+        "Ругайся только на обстоятельства, людей не оскорбляй." + add +
+        f"\n\nНедавний контекст:\n{ctx_block}\n\n"
         f"Сообщение с упоминанием:\n«{m.text}»"
     )
     try:
-        reply = await ai_reply(system, user, temperature=0.6)
+        reply = await ai_reply(system, user, temperature=0.7)
         await m.reply(sanitize_html_whitelist(reply))
     except Exception:
         pass
 
 # ---------- Ответ в ВЕТКЕ на сообщение бота ----------
 async def reply_to_thread(m: Message):
-    """Отвечаем, когда пользователь ответил реплаем на сообщение бота."""
-    # мягкий антиспам: позволим чаще, чем авто-вмешательства
     if is_quiet_hours(datetime.now().astimezone()):
         return
     if not can_autoreply(m.chat.id, cooldown_min=2, per_hour_limit=12):
@@ -473,18 +504,19 @@ async def reply_to_thread(m: Message):
         lines.append(f"{handle}: {t}")
     ctx_block = "\n".join(lines)
 
+    epithet = maybe_pick_epithet(0.66)
     system = persona_prompt()
+    add = f"\nЕсли уместно, можешь употребить ровно одно выражение: «{epithet}»." if epithet else ""
     user = (
-        "Пользователь ответил реплаем на твоё сообщение в чате. "
-        "Дай остроумный краткий ответ (1–2 фразы), не обращаясь к нему по имени и без @. "
-        "Изящный строгий мат допустим по обстоятельствам, людей не оскорбляй.\n\n"
-        f"Недавний контекст:\n{ctx_block}\n\n"
+        "Пользователь ответил реплаем на твоё сообщение. "
+        "Дай остроумный краткий ответ (1–2 фразы), не обращаясь по имени и без @." + add +
+        f"\n\nНедавний контекст:\n{ctx_block}\n\n"
         f"Реплай пользователя:\n«{m.text}»"
     )
     try:
-        reply = await ai_reply(system, user, temperature=0.6)
+        reply = await ai_reply(system, user, temperature=0.72)
         await m.reply(sanitize_html_whitelist(reply))
-        bump_autoreply(m.chat.id)  # засчитываем в статистику
+        bump_autoreply(m.chat.id)
     except Exception:
         pass
 
@@ -495,10 +527,8 @@ async def maybe_reply(m: Message):
     if m.via_bot or m.forward_origin:
         return
     me = await bot.get_me()
-    # если это ответ на бота — это обрабатывает reply_to_thread
     if m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id:
         return
-    # если явно упомянули бота — это обрабатывает reply_to_mention
     if mentions_bot(m.text, me.username):
         return
     if not is_question(m.text):
@@ -517,17 +547,18 @@ async def maybe_reply(m: Message):
         lines.append(f"{handle}: {t}")
     ctx_block = "\n".join(lines[-20:])
 
+    epithet = maybe_pick_epithet(0.5)
     system = persona_prompt()
+    add = f"\nЕсли уместно, используй ровно одно выражение: «{epithet}»." if epithet else ""
     user = (
         "Это фрагмент недавнего группового чата. Вмешайся уместно и ответь на вопрос. "
         "Пиши 1–2 короткие фразы, сухое остроумие, лёгкий троллинг. "
-        "Никого по имени не упоминай, @ не используй. "
-        "Изящный строгий мат допустим по обстоятельствам, но людей не оскорбляй.\n\n"
-        f"Контекст:\n{ctx_block}\n\n"
+        "Никого по имени не упоминай, @ не используй. Людей не оскорбляй." + add +
+        f"\n\nКонтекст:\n{ctx_block}\n\n"
         f"Вопрос:\n«{m.text}»"
     )
     try:
-        reply = await ai_reply(system, user, temperature=0.7)
+        reply = await ai_reply(system, user, temperature=0.75)
     except Exception:
         return
 
