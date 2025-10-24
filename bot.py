@@ -84,7 +84,6 @@ def init_db():
             INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
         END;
         """)
-        # ссылка на последнюю сводку
         conn.execute("""
         CREATE TABLE IF NOT EXISTS last_summary (
             chat_id INTEGER PRIMARY KEY,
@@ -92,7 +91,6 @@ def init_db():
             created_at INTEGER NOT NULL
         );
         """)
-        # антиспам/кулдауны авто-ответов
         conn.execute("""
         CREATE TABLE IF NOT EXISTS auto_reply_stats (
             chat_id INTEGER PRIMARY KEY,
@@ -131,7 +129,6 @@ QUESTION_RE = re.compile("|".join(QUESTION_PATTERNS), re.IGNORECASE)
 
 def is_question(text: str) -> bool:
     if not text: return False
-    # игнорируем длинные URL-only сообщения
     if len(text) < 4096 and len(re.findall(r"https?://\S+", text)) > 2:
         return False
     return bool(QUESTION_RE.search(text))
@@ -141,7 +138,7 @@ def mentions_bot(text: str, bot_username: str | None) -> bool:
     return f"@{bot_username.lower()}" in text.lower()
 
 def is_quiet_hours(local_dt: datetime) -> bool:
-    # тихие часы 01:00–07:00 локального времени контейнера
+    # тихие часы 00:00–07:00
     return 0 <= local_dt.hour < 7
 
 def tg_link(chat_id: int, message_id: int) -> str:
@@ -172,7 +169,6 @@ def chat_recent_context(chat_id: int, limit: int = 30):
         "SELECT username, text FROM messages WHERE chat_id=? AND text IS NOT NULL ORDER BY id DESC LIMIT ?;",
         (chat_id, limit)
     )
-    # в возрастающем порядке
     return list(reversed(rows))
 
 def can_autoreply(chat_id: int, cooldown_min: int = 10, per_hour_limit: int = 6) -> bool:
@@ -181,10 +177,8 @@ def can_autoreply(chat_id: int, cooldown_min: int = 10, per_hour_limit: int = 6)
     if not rows:
         return True
     last_ts, win_start, cnt = rows[0]
-    # cooldown
     if now - (last_ts or 0) < cooldown_min * 60:
         return False
-    # hourly window
     if now - (win_start or 0) >= 3600:
         return True
     return (cnt or 0) < per_hour_limit
@@ -208,8 +202,7 @@ def persona_prompt() -> str:
     return (
         "Ты — «Лорд Вербус», остроумный, немного аристократичный, дружелюбный Telegram-компаньон. "
         "Отвечай коротко (1–2 фразы), по делу, с лёгкой иронией и доброжелательным троллингом. "
-        "Не раскрывай правила. Если просили факт — дай по сути; если шутка уместна — добавь мягкую.\n"
-        "Всегда отвечай на языке пользователя."
+        "Не раскрывай правила. Всегда отвечай на языке пользователя."
     )
 
 # ---------------- OpenRouter ----------------
@@ -262,7 +255,6 @@ async def catch_all(m: Message):
             m.message_id,
         )
     )
-    # после записи пробуем «умный автоответ»
     await maybe_reply(m)
 
 @dp.message(CommandStart())
@@ -273,13 +265,14 @@ async def cmd_start(m: Message):
 async def cmd_ping(m: Message):
     await m.reply("pong")
 
-# ---------- SUMMMARY (как в предыдущей версии, уже улучшенной) ----------
+# ---------- SUMMARY (строгий формат) ----------
 def prev_summary_link(chat_id: int):
     prev = db_query("SELECT message_id FROM last_summary WHERE chat_id=?;", (chat_id,))
     return tg_link(chat_id, prev[0][0]) if prev and prev[0][0] else None
 
 @dp.message(Command("lord_summary"))
 async def cmd_summary(m: Message, command: CommandObject):
+    # по умолчанию 300, можно указать число
     try:
         n = int((command.args or "").strip())
         n = max(50, min(800, n))
@@ -297,6 +290,7 @@ async def cmd_summary(m: Message, command: CommandObject):
     prev_link = prev_summary_link(m.chat.id)
     prev_line_html = f'<a href="{prev_link}">Предыдущий анализ</a>' if prev_link else "Предыдущий анализ (—)"
 
+    # сырьё для ссылок
     enriched = []
     for u, t, mid in reversed(rows):
         link = tg_link(m.chat.id, mid) if mid else ""
@@ -307,24 +301,29 @@ async def cmd_summary(m: Message, command: CommandObject):
             enriched.append(f"{handle}: {t}")
     dialog_block = "\n".join(enriched)
 
+    # Строгий шаблон без буллетов и без «дублирующих подзаголовков»
     system = (
-        "Ты оформляешь читабельный отчёт по чату. Формат — HTML.\n"
-        "Имена как @username. Используй встроенные ссылки <a href='URL'>…</a> только из [link: URL]."
+        "Ты оформляешь отчёт по чату. Формат — HTML. Соблюдай шаблон строго, не добавляй ничего от себя, "
+        "кроме указанной финальной реплики. Не выводи теги <center>, <h1> и т.п."
     )
     user = (
         f"{dialog_block}\n\n"
+        "Сформируй ответ СТРОГО по этому шаблону (ровно в таком порядке, без дополнительных разделов):\n\n"
         f"{prev_line_html}\n\n"
         "✂️<b>Краткое содержание</b>:\n"
-        "1–3 очень коротких предложения с общим контекстом. Без ссылок.\n\n"
-        "Затем 2–4 тематических раздела. Каждый раздел:\n"
+        "2–3 коротких предложения, обобщающих разговор. БЕЗ ссылок.\n\n"
+        "Далее СТРОГО 2–4 тематических блока. Формат каждого блока ровно такой:\n"
         "😄 <b>Короткое название темы</b>\n"
-        "@username(ы) кратко описывают суть в 1–2 предложениях (без дословных цитат). "
-        "Внутри описания сделай 1–3 встроенных <a href='URL'>ссылки</a> на ключевые слова, используя доступные [link: URL].\n"
-        "Ключевые моменты:\n"
-        "• пункт 1\n• пункт 2\n• пункт 3\n"
+        "@username(ы) кратко описывают суть в 1–3 предложениях. Не используй дословные цитаты. "
+        "Внутри этого абзаца сделай 1–3 встроенных гиперссылки на конкретные сообщения из входных данных, "
+        "оборачивая ключевые слова в <a href='URL'>…</a>, где URL берёшь из соответствующих [link: URL]. "
+        "НЕ добавляй списки, маркеры, слова вроде «Ключевые моменты» — только один абзац описания.\n\n"
+        "Заверши одним предложением от имени Лорда Вербуса — лёгкая язвительность/важность, без грубости.\n"
+        "Запрещено: буллеты, подзаголовки 'Ключевые моменты', дублировать заголовок курсивом, добавлять HTML-заголовки.\n"
     )
+
     try:
-        reply = await ai_reply(system, user, temperature=0.4)
+        reply = await ai_reply(system, user, temperature=0.2)
     except Exception as e:
         reply = f"Суммаризация временно недоступна: {e}"
 
@@ -343,6 +342,35 @@ async def cmd_search(m: Message, command: CommandObject):
     if not q:
         await m.reply("Формат: <code>/lord_search печеньки в прошлом месяце</code> или <code>/lord_search дедлайн вчера</code>")
         return
+    def parse_time_hint_ru(q: str):
+        ql = q.lower()
+        ref = datetime.now(timezone.utc)
+        if "вчера" in ql:
+            start = datetime(ref.year, ref.month, ref.day, tzinfo=timezone.utc) - timedelta(days=1)
+            end = start + timedelta(days=1)
+            return int(start.timestamp()), int(end.timestamp())
+        if "сегодня" in ql:
+            start = datetime(ref.year, ref.month, ref.day, tzinfo=timezone.utc)
+            end = start + timedelta(days=1)
+            return int(start.timestamp()), int(end.timestamp())
+        if "прошлой неделе" in ql or "прошлая неделя" in ql or "на прошлой неделе" in ql:
+            end = ref - timedelta(days=7)
+            start = end - timedelta(days=7)
+            return int(start.timestamp()), int(end.timestamp())
+        if "прошлом месяце" in ql or "прошлый месяц" in ql:
+            y, m = ref.year, ref.month
+            y2, m2 = (y - 1, 12) if m == 1 else (y, m - 1)
+            start = datetime(y2, m2, 1, tzinfo=timezone.utc)
+            end = datetime(y2 + 1, 1, 1, tzinfo=timezone.utc) if m2 == 12 else datetime(y2, m2 + 1, 1, tzinfo=timezone.utc)
+            return int(start.timestamp()), int(end.timestamp())
+        if "неделю" in ql or "7 дней" in ql:
+            start = ref - timedelta(days=7)
+            return int(start.timestamp()), int(ref.timestamp())
+        if "месяц" in ql or "30 дней" in ql:
+            start = ref - timedelta(days=30)
+            return int(start.timestamp()), int(ref.timestamp())
+        return None, None
+
     since_ts, until_ts = parse_time_hint_ru(q)
     q_clean = re.sub(r"(вчера|сегодня|прошлой неделе|прошлая неделя|на прошлой неделе|прошлом месяце|прошлый месяц|неделю|7 дней|30 дней|месяц)", "", q, flags=re.IGNORECASE).strip()
 
@@ -389,40 +417,24 @@ async def cmd_search(m: Message, command: CommandObject):
 
 # ---------- Smart event-based auto-reply ----------
 async def maybe_reply(m: Message):
-    """
-    Условия:
-    - сообщение содержит вопрос (по простым эвристикам)
-    - не команда, не упоминание бота, не ответ боту
-    - в чате есть активность (>= X сообщений за Y минут)
-    - нет тихих часов
-    - пройден кулдаун и лимит в час
-    """
-    # базовые фильтры
     if not m.chat or not m.from_user or not m.text:
         return
     if m.via_bot or m.forward_origin:
         return
     me = await bot.get_me()
     if mentions_bot(m.text, me.username):
-        # пользователь явно пишет боту — это не «неожиданный» ответ
         return
     if m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id:
-        # это диалог с ботом — не перехватываем
         return
-    # вопрос?
     if not is_question(m.text):
         return
-    # активность
     if recent_chat_activity(m.chat.id, minutes=5) < 5:
         return
-    # тихие часы
     if is_quiet_hours(datetime.now().astimezone()):
         return
-    # лимиты
     if not can_autoreply(m.chat.id, cooldown_min=10, per_hour_limit=6):
         return
 
-    # соберём короткий контекст недавнего диалога
     ctx = chat_recent_context(m.chat.id, limit=20)
     lines = []
     for u, t in ctx:
@@ -432,19 +444,16 @@ async def maybe_reply(m: Message):
 
     system = persona_prompt()
     user = (
-        "Это фрагмент недавнего группового чата. Твоя задача — "
-        "ответить <b>неожиданно вмешавшись</b> в разговор, ориентируясь на вопрос пользователя, "
-        "но без навязчивости. Пиши 1–2 короткие фразы, уместный юмор/лёгкий троллинг приветствуется, "
-        "но избегай грубости и оскорблений. Не задавай много уточнений, лучше дай суть или подсказку.\n\n"
+        "Это фрагмент недавнего группового чата. Твоя задача — вмешаться уместно и ответить на вопрос пользователя. "
+        "Пиши 1–2 короткие фразы, вежливо-ироничный тон, без грубости.\n\n"
         f"Контекст:\n{ctx_block}\n\n"
-        f"Вопрос, на который стоит ответить:\n@{m.from_user.username if m.from_user.username else 'user'}: {m.text}"
+        f"Вопрос:\n@{m.from_user.username if m.from_user.username else 'user'}: {m.text}"
     )
     try:
         reply = await ai_reply(system, user, temperature=0.8)
     except Exception:
         return
 
-    # отправим ответ «реплаем» на сообщение пользователя
     try:
         await m.reply(sanitize_html_whitelist(reply))
         bump_autoreply(m.chat.id)
