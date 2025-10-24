@@ -99,11 +99,9 @@ def now_ts() -> int:
 # Helpers
 # =========================
 QUESTION_PATTERNS = [
-    r"\?",
     r"\bкто\b", r"\bчто\b", r"\bкак\b", r"\bпочему\b", r"\bзачем\b",
     r"\bкогда\b", r"\bгде\b", r"\bкакой\b", r"\bкакая\b", r"\bкакие\b",
-    r"\bсколько\b", r"\bможно ли\b", r"\bесть ли\b",
-    r"\bwho\b", r"\bwhat\b", r"\bhow\b", r"\bwhy\b", r"\bwhen\b", r"\bwhere\b"
+    r"\bсколько\b", r"\bможно ли\b", r"\bесть ли\b"
 ]
 QUESTION_RE = re.compile("|".join(QUESTION_PATTERNS), re.IGNORECASE)
 
