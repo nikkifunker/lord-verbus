@@ -113,6 +113,20 @@ def get_user_messages(chat_id: int, user_id: int | None, username: str | None, l
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
+# === Rate limiting for spontaneous replies ===
+LAST_INTERJECT: dict[int, int] = {}  # {chat_id: timestamp последнего "самопроизвольного" ответа}
+
+def can_interject(chat_id: int, cooldown: int = 3600) -> bool:
+    """
+    Возвращает True, если можно вставить реплику (прошёл cooldown в секундах).
+    """
+    now = now_ts()
+    last = LAST_INTERJECT.get(chat_id, 0)
+    if now - last < cooldown:
+        return False
+    LAST_INTERJECT[chat_id] = now
+    return True
+
 # =========================
 # Helpers
 # =========================
@@ -553,7 +567,9 @@ async def maybe_interject(m: Message):
     if is_quiet_hours(local_dt): return
     if not is_question(m.text or ""): return
     if random.random() > 0.33: return
-
+    if not can_interject(m.chat.id, cooldown=1800):  # 1800 секунд = 30 мин
+        return
+        
     ctx_rows = db_query(
         "SELECT username, text FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 8;",
         (m.chat.id,)
