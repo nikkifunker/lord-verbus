@@ -690,28 +690,6 @@ async def on_video_note_watch(m: Message):
             # fallback — без HTML на всякий случай
             await m.reply(f"@{NOTIFY_USERNAME}, видеокружок от @{user.username or user.id}")
 
-    # 2) ЛС уведомление адресату (чтобы точно увидел)
-    try:
-        await bot.send_message(
-            NOTIFY_USER_ID,
-            (
-                f"🔔 {who_html} отправил видеокружок"
-                f" в чате «{m.chat.title or 'личный чат'}» (id: {m.chat.id}).{link_html}"
-            ),
-            disable_web_page_preview=True
-        )
-        # попробуем переслать сам кружок
-        try:
-            await m.forward(chat_id=NOTIFY_USER_ID)
-        except Exception:
-            try:
-                await m.copy_to(chat_id=NOTIFY_USER_ID)
-            except Exception:
-                pass
-    except Exception:
-        # если нельзя написать в ЛС (диалога ещё не было) — просто игнорируем
-        pass
-
 # =========================
 # Commands list
 # =========================
