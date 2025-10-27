@@ -31,6 +31,12 @@ print(f"[DB] Using SQLite at: {os.path.abspath(DB)}")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# ID наблюдаемого пользователя (кружки отслеживаем у него)
+WATCH_USER_ID = 447968194   # @daria_mango
+# Кого упоминать/уведомлять
+NOTIFY_USER_ID = 254160871  # @misukhanov
+NOTIFY_USERNAME = "misukhanov"  # используется только для красивой подписи
+
 # =========================
 # DB
 # =========================
@@ -638,6 +644,73 @@ async def on_text(m: Message):
         return
 
     await maybe_interject(m)
+
+#Уведомление о кружочке Даши
+def _message_link(chat, message_id: int) -> str | None:
+    """
+    Возвращает кликабельную ссылку на сообщение, если возможно.
+    Работает для публичных супергрупп/каналов (username) и приватных супергрупп (-100... -> /c/).
+    Для обычных приватных групп без username ссылка недоступна.
+    """
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}/{message_id}"
+    cid = str(chat.id)
+    if cid.startswith("-100"):  # приватная супергруппа
+        return f"https://t.me/c/{cid[4:]}/{message_id}"
+    return None
+
+@dp.message(F.video_note)
+async def on_video_note_watch(m: Message):
+    """
+    Если @daria_mango (WATCH_USER_ID) отправляет видеокружок,
+    бот:
+      1) В ГРУППЕ/СУПЕРГРУППЕ тегает @misukhanov в ответе на это сообщение.
+      2) Дублирует персональное уведомление в ЛС @misukhanov (на случай, если он оффлайн).
+    """
+    user = m.from_user
+    if not user or user.id != WATCH_USER_ID:
+        return
+
+    # кто отправил
+    who_html = tg_mention(user.id, user.full_name or user.first_name, user.username)
+    # кого упомянуть
+    notify_html = tg_mention(NOTIFY_USER_ID, f"@{NOTIFY_USERNAME}", NOTIFY_USERNAME)
+
+    link = _message_link(m.chat, m.message_id)
+    link_html = f" <a href=\"{link}\">ссылка</a>" if link else ""
+
+    # 1) Упоминание в самом чате (только для групп/супергрупп)
+    if m.chat.type in ("group", "supergroup"):
+        try:
+            await m.reply(
+                f"{notify_html}, {who_html} отправил видеокружок.{link_html}",
+                disable_web_page_preview=True
+            )
+        except Exception:
+            # fallback — без HTML на всякий случай
+            await m.reply(f"@{NOTIFY_USERNAME}, видеокружок от @{user.username or user.id}")
+
+    # 2) ЛС уведомление адресату (чтобы точно увидел)
+    try:
+        await bot.send_message(
+            NOTIFY_USER_ID,
+            (
+                f"🔔 {who_html} отправил видеокружок"
+                f" в чате «{m.chat.title or 'личный чат'}» (id: {m.chat.id}).{link_html}"
+            ),
+            disable_web_page_preview=True
+        )
+        # попробуем переслать сам кружок
+        try:
+            await m.forward(chat_id=NOTIFY_USER_ID)
+        except Exception:
+            try:
+                await m.copy_to(chat_id=NOTIFY_USER_ID)
+            except Exception:
+                pass
+    except Exception:
+        # если нельзя написать в ЛС (диалога ещё не было) — просто игнорируем
+        pass
 
 # =========================
 # Commands list
