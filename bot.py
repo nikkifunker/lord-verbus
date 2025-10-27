@@ -573,7 +573,7 @@ async def maybe_interject(m: Message):
     if is_quiet_hours(local_dt): return
     if not is_question(m.text or ""): return
     if random.random() > 0.33: return
-    if not can_interject(m.chat.id, cooldown=1800):  # 1800 секунд = 30 мин
+    if not can_interject(m.chat.id, cooldown=3600):  # 1800 секунд = 30 мин
         return
         
     ctx_rows = db_query(
