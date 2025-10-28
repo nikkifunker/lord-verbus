@@ -38,6 +38,30 @@ NOTIFY_USER_ID = 254160871  # @misukhanov
 NOTIFY_USERNAME = "misukhanov"  # используется только для красивой подписи
 
 # =========================
+# ACHIEVEMENTS: определения (ЕДИНСТВЕННАЯ РЕДАКТИРУЕМАЯ ФУНКЦИЯ)
+# Типы правил сейчас:
+#   • counter_at_least — выдать, когда user_counters[user_id, key] ≥ threshold
+# Поля словаря: code, title, description, emoji, type, key, threshold, active, meta(None/JSON)
+# =========================
+def define_achievements() -> list[dict]:
+    return [
+        {
+            "code": "Q10",
+            "title": "В очко себе сделай Q",
+            "description": "10 раз сделал /q",
+            "emoji": "🎯",
+            "type": "counter_at_least",
+            "key": "cmd:/q",
+            "threshold": 10,
+            "active": 1,
+            "meta": None,
+        },
+        # Примеры для будущего:
+        # {"code":"MSG100","title":"Голос чата","description":"100 сообщений",
+        #  "emoji":"💬","type":"counter_at_least","key":"msg:total","threshold":100,"active":1,"meta":None},
+    ]
+
+# =========================
 # DB
 # =========================
 def init_db():
@@ -86,6 +110,56 @@ def init_db():
             created_at INTEGER
         );
         """)
+
+        # ===== Achievements (универсальные таблицы) =====
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS achievements (
+            code TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            emoji TEXT DEFAULT '🏆',
+            type TEXT NOT NULL,
+            key TEXT,
+            threshold INTEGER,
+            active INTEGER NOT NULL DEFAULT 1,
+            meta TEXT
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_achievements (
+            user_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            earned_at INTEGER NOT NULL,
+            PRIMARY KEY(user_id, code),
+            FOREIGN KEY(code) REFERENCES achievements(code)
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_counters (
+            user_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(user_id, key)
+        );
+        """)
+
+        # seed/sync из define_achievements()
+        ach_defs = define_achievements()
+        for a in ach_defs:
+            conn.execute("""
+            INSERT INTO achievements (code, title, description, emoji, type, key, threshold, active, meta)
+            VALUES (:code, :title, :description, :emoji, :type, :key, :threshold, :active, :meta)
+            ON CONFLICT(code) DO UPDATE SET
+                title=excluded.title,
+                description=excluded.description,
+                emoji=excluded.emoji,
+                type=excluded.type,
+                key=excluded.key,
+                threshold=COALESCE(excluded.threshold, threshold),
+                active=excluded.active,
+                meta=excluded.meta;
+            """, a)
+
         conn.commit()
 
 def db_execute(sql: str, params: tuple = ()):
@@ -114,7 +188,6 @@ def get_user_messages(chat_id: int, user_id: int | None, username: str | None, l
             (chat_id, username, limit)
         )
     return []
-
 
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
@@ -428,7 +501,7 @@ async def cmd_lord_psych(m: Message, command: CommandObject):
         return
 
     texts = [t for (t, mid, ts) in rows]
-    def clean(s): 
+    def clean(s):
         return re.sub(r"\s+", " ", (s or "")).strip()
     joined = " \n".join(clean(t) for t in texts[:500])
     if len(joined) > 8000:
@@ -461,7 +534,6 @@ async def cmd_lord_psych(m: Message, command: CommandObject):
     try:
         reply = await ai_reply(system, user, temperature=0.55)
         reply = strip_outer_quotes(reply)
-        # ничего не линкуем; оставляем только безопасные теги (допустимы <b>/<i> и т.п.)
         await m.reply(sanitize_html_whitelist(reply))
     except Exception as e:
         await m.reply(f"Портрет временно недоступен: {e}")
@@ -576,7 +648,7 @@ async def maybe_interject(m: Message):
     if random.random() > 0.33: return
     if not can_interject(m.chat.id, cooldown=3600):  # 1800 секунд = 30 мин
         return
-        
+
     ctx_rows = db_query(
         "SELECT username, text FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 8;",
         (m.chat.id,)
@@ -598,6 +670,95 @@ async def maybe_interject(m: Message):
         bump_reply_counter()
 
 # =========================
+# ACHIEVEMENTS: ядро (счётчики, выдача, редкость)
+# =========================
+def _achv_user_count(user_id: int) -> int:
+    row = db_query("SELECT COUNT(*) FROM user_achievements WHERE user_id=?;", (user_id,))
+    return int(row[0][0]) if row else 0
+
+def _achv_total_holders(code: str) -> int:
+    row = db_query("SELECT COUNT(DISTINCT user_id) FROM user_achievements WHERE code=?;", (code,))
+    return int(row[0][0]) if row else 0
+
+def _achv_population_size() -> int:
+    row = db_query("SELECT COUNT(*) FROM users;")
+    return int(row[0][0]) if row else 0
+
+def _achv_rarity_percent(code: str) -> float:
+    holders = _achv_total_holders(code)
+    pop = max(_achv_population_size(), 1)
+    return round(100.0 * holders / pop, 2)
+
+def _styled_achv_card(code: str, title: str, desc: str, emoji: str, rarity_pct: float) -> str:
+    return (
+        f"<b>{emoji} Ачивка разблокирована!</b>\n"
+        f"┌───────────────────────────────┐\n"
+        f"│ <b>{_html.escape(title)}</b>\n"
+        f"│ {_html.escape(desc)}\n"
+        f"│ Редкость: <i>{rarity_pct}%</i>\n"
+        f"└───────────────────────────────┘"
+    )
+
+def _styled_achv_counter(n: int) -> str:
+    medals = "🏅" * min(n, 10)
+    tail = f" +{n-10}" if n > 10 else ""
+    return f"{medals}{tail}  <b>{n}</b>"
+
+def inc_counter(user_id: int, key: str, delta: int = 1) -> int:
+    with closing(sqlite3.connect(DB)) as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO user_counters(user_id, key, value) VALUES(?, ?, 0) ON CONFLICT(user_id, key) DO NOTHING;", (user_id, key))
+        cur.execute("UPDATE user_counters SET value = value + ? WHERE user_id=? AND key=?;", (delta, user_id, key))
+        conn.commit()
+        cur.execute("SELECT value FROM user_counters WHERE user_id=? AND key=?;", (user_id, key))
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+def _get_counter(user_id: int, key: str) -> int:
+    row = db_query("SELECT value FROM user_counters WHERE user_id=? AND key=?;", (user_id, key))
+    return int(row[0][0]) if row else 0
+
+def _has_achievement(user_id: int, code: str) -> bool:
+    row = db_query("SELECT 1 FROM user_achievements WHERE user_id=? AND code=? LIMIT 1;", (user_id, code))
+    return bool(row)
+
+def _grant_achievement(user_id: int, code: str) -> None:
+    db_execute(
+        "INSERT OR IGNORE INTO user_achievements(user_id, code, earned_at) VALUES (?, ?, ?);",
+        (user_id, code, now_ts())
+    )
+
+async def check_achievements_for_user(uid: int, m: Message | None, updated_keys: list[str]) -> None:
+    """
+    Общая точка проверки: вызывай после инкремента счётчиков.
+    updated_keys — список ключей, которые сейчас изменились (для быстрой фильтрации).
+    """
+    achs = db_query("SELECT code, title, description, emoji, type, key, threshold, active FROM achievements WHERE active=1;")
+    if not achs:
+        return
+    dn, un = None, None
+    urow = db_query("SELECT display_name, username FROM users WHERE user_id=? LIMIT 1;", (uid,))
+    if urow:
+        dn, un = urow[0]
+    for code, title, desc, emoji, atype, key, threshold, active in achs:
+        if atype == "counter_at_least":
+            if key not in updated_keys:
+                continue
+            if _has_achievement(uid, code):
+                continue
+            if _get_counter(uid, key) >= int(threshold or 0):
+                _grant_achievement(uid, code)
+                rarity = _achv_rarity_percent(code)
+                card = _styled_achv_card(code, title, desc, emoji or "🏆", rarity)
+                who = tg_mention(uid, dn or (m.from_user.full_name if m and m.from_user else None), un or (m.from_user.username if m and m.from_user else None))
+                tail = "Чтобы посмотреть все свои ачивки, напиши команду /achievements"
+                if m:
+                    try:
+                        await m.reply(f"{who}\n{card}\n\n<i>{tail}</i>", disable_web_page_preview=True)
+                    except Exception:
+                        await m.reply(f"{(m.from_user.first_name if m and m.from_user else 'Пользователь')} получил ачивку: {title}. {tail}")
+
+# =========================
 # Handlers
 # =========================
 @dp.message(CommandStart())
@@ -606,6 +767,8 @@ async def start(m: Message):
         "Я — Лорд Вербус. Команды:\n"
         "• /lord_summary — краткий отчёт по беседе\n"
         "• /lord_psych — психологический портрет участника (ответь на его сообщение или укажи @username)\n"
+        "• /achievements — посмотреть свои ачивки\n"
+        "• /achievements_top — топ по ачивкам\n"
         "Просто говорите — я вмешаюсь, если нужно."
     )
 
@@ -622,7 +785,7 @@ async def on_text(m: Message):
              m.from_user.username if m.from_user else None,
              m.text, now_ts(), m.message_id)
         )
-        # — обновляем карточку пользователя (для кликабельных имён в саммари)
+        # — обновляем карточку пользователя (для кликабельных имён и метрик)
         if m.from_user:
             full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
             db_execute(
@@ -630,6 +793,10 @@ async def on_text(m: Message):
                 "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
                 (m.from_user.id, full_name, m.from_user.username)
             )
+            # инкремент универсального счётчика сообщений (для будущих ачивок типа MSG100)
+            inc_counter(m.from_user.id, "msg:total", 1)
+            # можно проверять ачивки, если появятся, завязанные на msg:total
+            # await check_achievements_for_user(m.from_user.id, m, updated_keys=["msg:total"])
 
     me = await bot.get_me()
 
@@ -646,7 +813,84 @@ async def on_text(m: Message):
 
     await maybe_interject(m)
 
-#Уведомление о кружочке Даши
+# =========================
+# Achievements: команды
+# =========================
+@dp.message(Command("achievements"))
+async def cmd_achievements(m: Message):
+    if not m.from_user:
+        return
+    uid = m.from_user.id
+    rows = db_query(
+        "SELECT a.code, a.title, a.description, a.emoji, ua.earned_at "
+        "FROM user_achievements ua JOIN achievements a ON a.code=ua.code "
+        "WHERE ua.user_id=? ORDER BY ua.earned_at DESC;",
+        (uid,)
+    )
+    total = len(rows)
+    counter = _styled_achv_counter(total)
+    if total == 0:
+        await m.reply("У тебя пока нет ачивок. Продолжай — судьба любит настойчивых.")
+        return
+    lines = [f"🏆 Твои ачивки: {counter}\n"]
+    for code, title, desc, emoji, ts in rows:
+        rarity = _achv_rarity_percent(code)
+        when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        lines.append(
+            f"{emoji} <b>{_html.escape(title)}</b>  "
+            f"<i>{rarity}%</i>\n"
+            f"— {_html.escape(desc)}  ·  <span class='tg-spoiler'>{when}</span>"
+        )
+    await m.reply("\n".join(lines), disable_web_page_preview=True)
+
+@dp.message(Command("achievements_top"))
+async def cmd_achievements_top(m: Message):
+    rows = db_query(
+        "SELECT ua.user_id, COUNT(*) as cnt "
+        "FROM user_achievements ua "
+        "GROUP BY ua.user_id "
+        "ORDER BY cnt DESC, MIN(ua.earned_at) ASC "
+        "LIMIT 10;"
+    )
+    if not rows:
+        await m.reply("Топ пуст. Пора уже кому-то заработать первую ачивку.")
+        return
+    ids = tuple(r[0] for r in rows)
+    placeholders = ",".join(["?"] * len(ids)) if ids else ""
+    users = {}
+    if ids:
+        urows = db_query(f"SELECT user_id, display_name, username FROM users WHERE user_id IN ({placeholders});", ids)
+        for uid, dn, un in urows:
+            users[uid] = (dn, un)
+    out = ["<b>🏆 ТОП по ачивкам</b>\n"]
+    rank = 1
+    for uid, cnt in rows:
+        dn, un = users.get(uid, (None, None))
+        out.append(f"{rank}. {tg_mention(uid, dn, un)} — <b>{cnt}</b> {('🏅'*min(cnt,5))}")
+        rank += 1
+    await m.reply("\n".join(out), disable_web_page_preview=True)
+
+# =========================
+# Трекинг /q → универсальный счётчик + проверка правил
+# =========================
+@dp.message(Command("q"))
+async def track_q_and_maybe_award(m: Message):
+    if not m.from_user:
+        return
+    uid = m.from_user.id
+    # поддержим users-карточку (для редкости/кликабельности)
+    full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
+    db_execute(
+        "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
+        (uid, full_name, m.from_user.username)
+    )
+    inc_counter(uid, "cmd:/q", 1)
+    await check_achievements_for_user(uid, m, updated_keys=["cmd:/q"])
+
+# =========================
+# Уведомление о кружочке Даши
+# =========================
 def _message_link(chat, message_id: int) -> str | None:
     """
     Возвращает кликабельную ссылку на сообщение, если возможно.
@@ -666,21 +910,18 @@ async def on_video_note_watch(m: Message):
     Если @daria_mango (WATCH_USER_ID) отправляет видеокружок,
     бот:
       1) В ГРУППЕ/СУПЕРГРУППЕ тегает @misukhanov в ответе на это сообщение.
-      2) Дублирует персональное уведомление в ЛС @misukhanov (на случай, если он оффлайн).
+      2) (опционально можно добавить дублирование в ЛС — сейчас отключено)
     """
     user = m.from_user
     if not user or user.id != WATCH_USER_ID:
         return
 
-    # кто отправил
     who_html = tg_mention(user.id, user.full_name or user.first_name, user.username)
-    # кого упомянуть
     notify_html = tg_mention(NOTIFY_USER_ID, f"@{NOTIFY_USERNAME}", NOTIFY_USERNAME)
 
     link = _message_link(m.chat, m.message_id)
     link_html = f" <a href=\"{link}\">ссылка</a>" if link else ""
 
-    # 1) Упоминание в самом чате (только для групп/супергрупп)
     if m.chat.type in ("group", "supergroup"):
         try:
             await m.reply(
@@ -688,7 +929,6 @@ async def on_video_note_watch(m: Message):
                 disable_web_page_preview=True
             )
         except Exception:
-            # fallback — без HTML на всякий случай
             await m.reply(f"@{NOTIFY_USERNAME}, видеокружок от @{user.username or user.id}")
 
 # =========================
@@ -698,11 +938,15 @@ async def set_commands():
     commands_group = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
         BotCommand(command="lord_psych",  description="Психологический портрет участника"),
+        BotCommand(command="achievements", description="Показать мои ачивки"),
+        BotCommand(command="achievements_top", description="Топ по ачивкам"),
     ]
     commands_private = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
         BotCommand(command="lord_psych",  description="Психологический портрет участника"),
         BotCommand(command="start", description="Приветствие"),
+        BotCommand(command="achievements", description="Показать мои ачивки"),
+        BotCommand(command="achievements_top", description="Топ по ачивкам"),
     ]
     await bot.set_my_commands(commands_group, scope=BotCommandScopeAllGroupChats())
     await bot.set_my_commands(commands_private, scope=BotCommandScopeAllPrivateChats())
