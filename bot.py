@@ -31,7 +31,7 @@ print(f"[DB] Using SQLite at: {os.path.abspath(DB)}")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ID наблюдаемого пользователя (кружки отслеживаем у него)
+ADMIN_IDS = {320872593}
 WATCH_USER_ID = 447968194   # @daria_mango
 # Кого упоминать/уведомлять
 NOTIFY_USER_ID = 254160871  # @misukhanov
@@ -262,6 +262,35 @@ QUESTION_PATTERNS = [
     r"\bсколько\b", r"\bможно ли\b", r"\bесть ли\b"
 ]
 QUESTION_RE = re.compile("|".join(QUESTION_PATTERNS), re.IGNORECASE)
+
+def get_achievement_by_code(code: str):
+    rows = db_query(
+        "SELECT code, title, description, emoji, type, key, threshold, active FROM achievements WHERE code=? LIMIT 1;",
+        (code.strip().upper(),)
+    )
+    return rows[0] if rows else None
+
+def get_family_by_code(code: str):
+    """Находит 'семью' 3-ступенчатых ачивок: все записи с тем же type+key, отсортированные по threshold."""
+    a = get_achievement_by_code(code)
+    if not a:
+        return []
+    _code, _title, _desc, _emoji, atype, akey, _thr, _active = a
+    rows = db_query(
+        "SELECT code, title, description, emoji, type, key, threshold "
+        "FROM achievements WHERE active=1 AND type=? AND key=? ORDER BY COALESCE(threshold, 0) ASC;",
+        (atype, akey),
+    )
+    return rows
+
+def resolve_counter_key_for_user(atype: str, key_prefix: str) -> str:
+    """Возвращает конкретный ключ счётчика для текущего периода/типа."""
+    if atype == "counter_at_least":
+        return key_prefix
+    elif atype == "counter_at_least_monthly":
+        return month_key(key_prefix)  # prefix:YYYY-MM
+    return key_prefix
+
 
 def month_key(prefix: str, dt: datetime | None = None) -> str:
     """
@@ -920,25 +949,182 @@ async def cmd_achievements_top(m: Message):
 # Диагностика
 @dp.message(Command("ach_debug"))
 async def cmd_ach_debug(m: Message):
+    """
+    /ach_debug                — быстрый обзор по /q
+    /ach_debug <CODE>         — детальная диагностика по ачивке (например, VOIM10)
+    """
     if not m.from_user:
         return
     uid = m.from_user.id
+
+    # поддержим карточку пользователя
     full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
     db_execute(
         "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
         "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
         (uid, full_name, m.from_user.username)
     )
-    row = db_query("SELECT value FROM user_counters WHERE user_id=? AND key=?;", (uid, "cmd:/q"))
-    q_cnt = int(row[0][0]) if row else 0
-    has_q10 = bool(db_query("SELECT 1 FROM user_achievements WHERE user_id=? AND code='Q10' LIMIT 1;", (uid,)))
+
+    args = (m.text or "").split()
+    if len(args) == 1:
+        # старое поведение: показываем /q
+        row = db_query("SELECT value FROM user_counters WHERE user_id=? AND key=?;", (uid, "cmd:/q"))
+        q_cnt = int(row[0][0]) if row else 0
+        has_q10 = bool(db_query("SELECT 1 FROM user_achievements WHERE user_id=? AND code='Q10' LIMIT 1;", (uid,)))
+        await m.reply(
+            f"🔍 Debug (быстро):\n"
+            f"• cmd:/q = <b>{q_cnt}</b>\n"
+            f"• Q10 выдана: <b>{'да' if has_q10 else 'нет'}</b>\n"
+            f"(Порог Q10: 10 раз /q)",
+            disable_web_page_preview=True
+        )
+        return
+
+    # Деталка по коду ачивки
+    code = args[1].strip().upper()
+    a = get_achievement_by_code(code)
+    if not a:
+        await m.reply(f"Не нашёл ачивку с кодом <b>{_html.escape(code)}</b>.")
+        return
+
+    acode, title, desc, emoji, atype, akey, thr, _active = a
+    real_key = resolve_counter_key_for_user(atype, akey)
+    row = db_query("SELECT value FROM user_counters WHERE user_id=? AND key=?;", (uid, real_key))
+    val = int(row[0][0]) if row else 0
+    has_it = bool(db_query("SELECT 1 FROM user_achievements WHERE user_id=? AND code=? LIMIT 1;", (uid, acode)))
+
+    # Если это 3-ступенчатая семья — покажем текущую ступень пользователя
+    family = get_family_by_code(acode)
+    tier_line = ""
+    if len(family) >= 2:
+        # определяем максимальную ступень по текущему значению
+        current_tier = None
+        for c_code, c_title, c_desc, c_emoji, c_type, c_key, c_thr in family:
+            if val >= int(c_thr or 0):
+                current_tier = (c_code, c_title, c_desc, c_emoji, c_thr)
+        if current_tier:
+            t_code, t_title, _t_desc, t_emoji, t_thr = current_tier
+            tier_line = f"\n• Текущая ступень: {t_emoji} <b>{_html.escape(t_title)}</b> (порог {t_thr})"
+        else:
+            # пока не набрал бронзу
+            first_thr = int(family[0][6] or 0)
+            tier_line = f"\n• Текущая ступень: — (до бронзы осталось {max(first_thr - val, 0)})"
+
+    pct = (val / max(int(thr or 1), 1)) * 100 if thr else 0.0
+    pct = round(min(pct, 999.99), 2)
+
     await m.reply(
-        f"🔍 Debug:\n"
-        f"• cmd:/q = <b>{q_cnt}</b>\n"
-        f"• Q10 выдана: <b>{'да' if has_q10 else 'нет'}</b>\n"
-        f"(Порог Q10: 10 раз /q)",
+        f"{emoji or '🏆'} <b>{_html.escape(title)}</b> [{acode}]\n"
+        f"Описание: {_html.escape(desc)}\n"
+        f"Тип: <code>{atype}</code>\n"
+        f"Ключ счётчика: <code>{real_key}</code>\n"
+        f"Порог: <b>{thr}</b>\n"
+        f"Текущее значение: <b>{val}</b>  ({pct}%)\n"
+        f"Выдана: <b>{'да' if has_it else 'нет'}</b>"
+        f"{tier_line}",
         disable_web_page_preview=True
     )
+
+@dp.message(Command("ach_progress"))
+async def cmd_ach_progress(m: Message):
+    """
+    /ach_progress <CODE>  — для админа: сводка по всем пользователям по семье ачивок указанного кода.
+    Показываем только ТЕКУЩУЮ ступень пользователя (бронза/серебро/золото) или прогресс до бронзы.
+    """
+    if not m.from_user or m.from_user.id not in ADMIN_IDS:
+        return  # молча игнорируем для не-админов
+
+    args = (m.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await m.reply("Использование: /ach_progress <CODE>")
+        return
+
+    code = args[1].strip().upper()
+    a = get_achievement_by_code(code)
+    if not a:
+        await m.reply(f"Не нашёл ачивку <b>{_html.escape(code)}</b>.")
+        return
+
+    acode, title, desc, emoji, atype, akey, _thr, _active = a
+    family = get_family_by_code(acode) or [a]
+    # ключ счётчика (для monthly — текущий месяц)
+    real_key = resolve_counter_key_for_user(atype, akey)
+
+    # Соберём текущие значения counters и уже выданные ачивки
+    cnt_rows = db_query("SELECT user_id, value FROM user_counters WHERE key=?;", (real_key,))
+    cnt_map = {uid: int(val) for (uid, val) in cnt_rows}
+
+    fam_codes = tuple([row[0] for row in family])
+    placeholders = ",".join(["?"] * len(fam_codes))
+    ach_rows = db_query(
+        f"SELECT user_id, code, earned_at FROM user_achievements WHERE code IN ({placeholders});",
+        fam_codes
+    )
+    # у кого какая максимальная ступень выдана
+    code_to_thr = {row[0]: int(row[6] or 0) for row in family}  # code -> threshold
+    achieved_best = {}
+    for uid, ccode, _ts in ach_rows:
+        prev = achieved_best.get(uid)
+        thr = code_to_thr.get(ccode, 0)
+        if not prev or thr > prev[1]:
+            achieved_best[uid] = (ccode, thr)
+
+    # подгрузим отображаемые имена
+    users_rows = db_query("SELECT user_id, display_name, username FROM users;")
+    users = {u: (dn, un) for (u, dn, un) in users_rows}
+
+    # сформируем строки
+    header = f"<b>{emoji or '🏆'} {title}</b> [{acode}] • ключ: <code>{real_key}</code>\n"
+    lines = [header]
+
+    # отсортируем по текущему значению (desc)
+    all_uids = set(cnt_map.keys()) | set(achieved_best.keys())
+    fam_sorted = sorted(family, key=lambda r: int(r[6] or 0))  # по threshold ASC
+
+    def user_tier(uid: int, val: int):
+        """Определяем текущую ступень по значению (а не только по факту выдачи)."""
+        tier = None
+        for c_code, c_title, c_desc, c_emoji, c_type, c_key, c_thr in fam_sorted:
+            if val >= int(c_thr or 0):
+                tier = (c_code, c_title, c_emoji, int(c_thr or 0))
+        return tier  # или None
+
+    # подготовим топ: сортировка по value (desc)
+    sorted_uids = sorted(all_uids, key=lambda u: cnt_map.get(u, 0), reverse=True)
+
+    for rank, uid in enumerate(sorted_uids, start=1):
+        val = cnt_map.get(uid, 0)
+        dn, un = users.get(uid, (None, None))
+        mention = tg_mention(uid, dn, un)
+        tier = user_tier(uid, val) if len(fam_sorted) >= 2 else None
+
+        if tier:
+            t_code, t_title, t_emoji, t_thr = tier
+            # найдём следующую ступень, чтобы показать прогресс к ней
+            next_thr = None
+            for c_code, c_title, c_desc, c_emoji, c_type, c_key, c_thr in fam_sorted:
+                c_thr = int(c_thr or 0)
+                if c_thr > t_thr:
+                    next_thr = c_thr
+                    break
+            if next_thr:
+                need = max(next_thr - val, 0)
+                lines.append(f"{rank}. {mention} — {t_emoji} <b>{_html.escape(t_title)}</b> · {val} (до следующей: {need})")
+            else:
+                lines.append(f"{rank}. {mention} — {t_emoji} <b>{_html.escape(t_title)}</b> · {val} (макс)")
+        else:
+            # ещё ниже первой ступени
+            first_thr = int(fam_sorted[0][6] or 0) if fam_sorted else 0
+            need = max(first_thr - val, 0)
+            lines.append(f"{rank}. {mention} — — · {val} (до бронзы: {need})")
+
+        # ограничим вывод первыми 100 строками на всякий случай
+        if rank >= 100:
+            lines.append("…")
+            break
+
+    await m.reply("\n".join(lines), disable_web_page_preview=True)
+
 
 # Алиасы на опечатки: /achievments, /achievments_top
 @dp.message(Command("achievments"))
