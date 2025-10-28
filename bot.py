@@ -68,6 +68,8 @@ def init_db():
     with closing(sqlite3.connect(DB)) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+
+        # ---- основная таблица сообщений ----
         conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +81,8 @@ def init_db():
             message_id INTEGER
         );
         """)
+
+        # полнотекстовый индекс + триггеры
         conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
         USING fts5(text, content='messages', content_rowid='id', tokenize='unicode61');
@@ -95,7 +99,8 @@ def init_db():
             INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
         END;
         """)
-        # — таблица пользователей для кликабельных имён в саммари
+
+        # пользователи (для кликабельных имён и статистики)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -103,6 +108,8 @@ def init_db():
             username TEXT
         );
         """)
+
+        # последняя ссылка на саммари
         conn.execute("""
         CREATE TABLE IF NOT EXISTS last_summary (
             chat_id INTEGER PRIMARY KEY,
@@ -111,18 +118,18 @@ def init_db():
         );
         """)
 
-        # ===== Achievements (универсальные таблицы) =====
+        # ======== Achievements: универсальные таблицы ========
         conn.execute("""
         CREATE TABLE IF NOT EXISTS achievements (
             code TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             description TEXT NOT NULL,
             emoji TEXT DEFAULT '🏆',
-            type TEXT NOT NULL,
-            key TEXT,
-            threshold INTEGER,
+            type TEXT,          -- тип правила (например, 'counter_at_least')
+            key TEXT,           -- ключ счётчика (например, 'cmd:/q')
+            threshold INTEGER,  -- порог для правил порогового типа
             active INTEGER NOT NULL DEFAULT 1,
-            meta TEXT
+            meta TEXT           -- JSON/зарезервировано
         );
         """)
         conn.execute("""
@@ -143,7 +150,22 @@ def init_db():
         );
         """)
 
-        # seed/sync из define_achievements()
+        # --- мягкая миграция колонок achievements (на случай старой базы) ---
+        def _ensure_column(table, col, ddl):
+            try:
+                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table});").fetchall()]
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl};")
+            except Exception:
+                pass
+
+        _ensure_column("achievements", "type", "TEXT")
+        _ensure_column("achievements", "key", "TEXT")
+        _ensure_column("achievements", "threshold", "INTEGER")
+        _ensure_column("achievements", "active", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column("achievements", "meta", "TEXT")
+
+        # ---- синхронизация справочника ачивок из define_achievements() ----
         ach_defs = define_achievements()
         for a in ach_defs:
             conn.execute("""
@@ -813,6 +835,32 @@ async def on_text(m: Message):
 
     await maybe_interject(m)
 
+@dp.message(Command("ach_debug"))
+async def cmd_ach_debug(m: Message):
+    if not m.from_user:
+        return
+    uid = m.from_user.id
+    # подгрузим имя в users (чтобы не было пусто)
+    full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
+    db_execute(
+        "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
+        (uid, full_name, m.from_user.username)
+    )
+
+    # считаем текущие значения
+    row = db_query("SELECT value FROM user_counters WHERE user_id=? AND key=?;", (uid, "cmd:/q"))
+    q_cnt = int(row[0][0]) if row else 0
+    has_q10 = bool(db_query("SELECT 1 FROM user_achievements WHERE user_id=? AND code='Q10' LIMIT 1;", (uid,)))
+    await m.reply(
+        f"🔍 Debug:\n"
+        f"• cmd:/q = <b>{q_cnt}</b>\n"
+        f"• Q10 выдана: <b>{'да' if has_q10 else 'нет'}</b>\n"
+        f"(Порог Q10: 10 раз /q)",
+        disable_web_page_preview=True
+    )
+
+
 # =========================
 # Achievements: команды
 # =========================
@@ -947,6 +995,7 @@ async def set_commands():
         BotCommand(command="start", description="Приветствие"),
         BotCommand(command="achievements", description="Показать мои ачивки"),
         BotCommand(command="achievements_top", description="Топ по ачивкам"),
+        BotCommand(command="ach_debug", description="Показать статистику по ачивкам (debug)"),
     ]
     await bot.set_my_commands(commands_group, scope=BotCommandScopeAllGroupChats())
     await bot.set_my_commands(commands_private, scope=BotCommandScopeAllPrivateChats())
