@@ -83,6 +83,15 @@ def define_achievements() -> list[dict]:
          "emoji":"🥈","type":"counter_at_least_monthly","key":"voice:month","threshold":100,"active":1,"meta":None},
         {"code":"VOIM1000","title":"Конченая мразь","description":"1000 голосовых за месяц, не, ну это пиздец. Нет слов, вызывайте дурку!",
          "emoji":"🥇","type":"counter_at_least_monthly","key":"voice:month","threshold":1000,"active":1,"meta":None},
+
+                # ===== PACK: Тест «testtest» (всего за всё время) =====
+        {"code":"TT1","title":"Тест-драйв","description":"Один раз написал слово testtest",
+         "emoji":"🧪","type":"counter_at_least","key":"testtest:total","threshold":1,"active":1,"meta":None},
+        {"code":"TT3","title":"Повторюшка","description":"Трижды написал слово testtest",
+         "emoji":"🧪","type":"counter_at_least","key":"testtest:total","threshold":3,"active":1,"meta":None},
+        {"code":"TT5","title":"Тестоман","description":"Пять раз написал слово testtest",
+         "emoji":"🧪","type":"counter_at_least","key":"testtest:total","threshold":5,"active":1,"meta":None},
+
     ]
 
 # ============================================================
@@ -340,6 +349,7 @@ def friendly_family_title(atype: str, akey: str) -> str:
         ("counter_at_least_monthly", "msg:month"): "Сообщения за месяц",
         ("counter_at_least_monthly", "voice:month"): "Голосовые за месяц",
         ("counter_at_least", "cmd:/q"): "Команда /q",
+        ("counter_at_least", "testtest:total"): "Тестовое слово «testtest»",
     }
     return m.get((atype, akey), akey)
 
@@ -739,7 +749,7 @@ def _grant_achievement(user_id: int, code: str) -> None:
     """Выдать ачивку (идемпотентно)."""
     db_execute("INSERT OR IGNORE INTO user_achievements(user_id, code, earned_at) VALUES (?, ?, ?);", (user_id, code, now_ts()))
 
-def check_achievements_for_user(uid: int, m: Message | None, updated_keys: list[str]) -> None:
+async def check_achievements_for_user(uid: int, m: Message | None, updated_keys: list[str]) -> None:
     """
     Центральная проверка: вызывай ПОСЛЕ инкремента счётчиков.
     Работает ПО СЕМЕЙСТВАМ: для каждого (type, key) проверяются все пороги (tiers)
@@ -1111,6 +1121,95 @@ async def cmd_ach_rescan(m: Message):
     who = "всем" if target.lower() == "all" else (target)
     await m.reply(f"Рескан завершён ({who}). Выдано новых ачивок: <b>{total_granted}</b>.", disable_web_page_preview=True)
 
+@dp.message(Command("ach_reset_counters"))
+async def cmd_ach_reset_counters(m: Message):
+    """
+    /ach_reset_counters              — сбросить ВСЕ счётчики (только для админов)
+    /ach_reset_counters <@user|id>   — сбросить счётчики у конкретного пользователя
+    """
+    if not m.from_user or m.from_user.id not in ADMIN_IDS:
+        return  # скрытая админ-команда
+
+    arg = (m.text or "").split(maxsplit=1)
+    target = arg[1].strip() if len(arg) == 2 else "all"
+
+    if target.lower() == "all":
+        db_execute("DELETE FROM user_counters;")
+        await m.reply("Счётчики <b>всех</b> пользователей сброшены.", disable_web_page_preview=True)
+        return
+
+    # один пользователь
+    if target.startswith("@"):
+        uname = target[1:]
+        row = db_query("SELECT user_id FROM users WHERE username=? LIMIT 1;", (uname,))
+        if not row:
+            await m.reply(f"Не нашёл пользователя @{uname} в базе."); return
+        uid = int(row[0][0])
+    else:
+        try:
+            uid = int(target)
+        except ValueError:
+            await m.reply("Ожидал: all | @username | user_id"); return
+
+    db_execute("DELETE FROM user_counters WHERE user_id=?;", (uid,))
+    await m.reply(f"Счётчики пользователя <code>{uid}</code> сброшены.", disable_web_page_preview=True)
+
+@dp.message(Command("ach_editstat")))
+async def cmd_ach_editstat(m: Message):
+    """
+    /ach_editstat @username ACH_CODE NEW_VALUE
+    Пример: /ach_editstat @nickname MSGM150 200
+    — найдёт ачивку по коду, вычислит реальный ключ счётчика (учтёт monthly) и выставит NEW_VALUE,
+      затем триггернёт проверку и выдачу недостающих ступеней.
+    """
+    if not m.from_user or m.from_user.id not in ADMIN_IDS:
+        return  # скрытая админ-команда
+
+    parts = (m.text or "").split()
+    if len(parts) != 4:
+        await m.reply("Формат: /ach_editstat @username ACH_CODE NEW_VALUE"); return
+
+    who, code, new_val_s = parts[1], parts[2].upper(), parts[3]
+    try:
+        new_val = int(new_val_s)
+    except ValueError:
+        await m.reply("NEW_VALUE должен быть целым числом."); return
+
+    # resolve user
+    if who.startswith("@"):
+        uname = who[1:]
+        row = db_query("SELECT user_id FROM users WHERE username=? LIMIT 1;", (uname,))
+        if not row:
+            await m.reply(f"Не нашёл пользователя @{uname} в базе."); return
+        uid = int(row[0][0])
+    else:
+        try:
+            uid = int(who)
+        except ValueError:
+            await m.reply("Ожидал @username или user_id."); return
+
+    a = get_achievement_by_code(code)
+    if not a:
+        await m.reply(f"Ачивка с кодом <b>{_html.escape(code)}</b> не найдена."); return
+
+    acode, title, desc, emoji, atype, akey, thr, _active = a
+    real_key = resolve_counter_key_for_user(atype, akey)
+
+    # upsert value
+    db_execute(
+        "INSERT INTO user_counters(user_id, key, value) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value;",
+        (uid, real_key, new_val)
+    )
+
+    # триггерим проверку (и по реальному ключу, и по «сырому» префиксу — на всякий случай)
+    await check_achievements_for_user(uid, m, updated_keys=[real_key, akey])
+
+    await m.reply(
+        f"Обновлено: <code>{uid}</code> — [{code}] <code>{real_key}</code> = <b>{new_val}</b>.\nПорог текущей ступени: <b>{thr}</b>.",
+        disable_web_page_preview=True
+    )
+
 
 # ============================================================
 # Хэндлеры событий (стикеры/войсы/тексты) — считать counters и выдавать ачивки
@@ -1174,6 +1273,11 @@ async def on_text(m: Message):
     k = month_key("msg:month")
     inc_counter(m.from_user.id, k, 1)
     await check_achievements_for_user(m.from_user.id, m, updated_keys=[k])
+
+        # Если сообщение содержит слово "testtest" — считаем как тестовый инкремент
+    if re.search(r"\btesttest\b", m.text, flags=re.IGNORECASE):
+        inc_counter(m.from_user.id, "testtest:total", 1)
+        await check_achievements_for_user(m.from_user.id, m, updated_keys=["testtest:total"])
 
     # ответы ИИ (упоминание / ответ в тред / иногда вмешаться)
     me = await bot.get_me()
