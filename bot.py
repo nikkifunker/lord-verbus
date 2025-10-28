@@ -752,21 +752,35 @@ async def check_achievements_for_user(uid: int, m: Message | None, updated_keys:
     urow = db_query("SELECT display_name, username FROM users WHERE user_id=? LIMIT 1;", (uid,))
     if urow: dn, un = urow[0]
 
+        # Группируем ачивки по семействам (type + key)
+    families: dict[tuple[str, str], list[tuple[str, str, str, str, int]]] = {}
     for code, title, desc, emoji, atype, key_field, threshold, active in achs:
-        if _has_achievement(uid, code):
+        families.setdefault((atype, key_field), []).append(
+            (code, title, desc, emoji, int(threshold or 0))
+        )
+
+    # Для каждого семейства проверяем пороги по возрастанию
+    for (atype, key_field), rows in families.items():
+        # Вычисляем «реальный» ключ счётчика (учитывая YYYY-MM для monthly)
+        if atype == "counter_at_least_monthly":
+            real_key = month_key(key_field)
+        else:
+            real_key = key_field
+
+        # Триггер: ресканим семейством только если изменился нужный ключ
+        # (принимаем и конкретный real_key, и «сырой» префикс на случай кривого updated_keys)
+        if (real_key not in updated_keys) and (key_field not in updated_keys):
             continue
 
-        if atype == "counter_at_least":
-            if key_field not in updated_keys:
-                continue
-            if _get_counter(uid, key_field) >= int(threshold or 0):
-                _grant_and_announce(uid, code, title, desc, emoji, m, dn, un)
+        # Текущее значение счётчика
+        val = _get_counter(uid, real_key)
 
-        elif atype == "counter_at_least_monthly":
-            current_key = month_key(key_field)
-            if current_key not in updated_keys and key_field not in updated_keys:
+        # Проверяем пороги от меньшего к большему и выдаём все недостающие
+        rows_sorted = sorted(rows, key=lambda r: r[4])  # r[4] = threshold
+        for code, title, desc, emoji, thr in rows_sorted:
+            if thr <= 0:
                 continue
-            if _get_counter(uid, current_key) >= int(threshold or 0):
+            if not _has_achievement(uid, code) and val >= thr:
                 _grant_and_announce(uid, code, title, desc, emoji, m, dn, un)
 
 
