@@ -263,6 +263,43 @@ QUESTION_PATTERNS = [
 ]
 QUESTION_RE = re.compile("|".join(QUESTION_PATTERNS), re.IGNORECASE)
 
+async def _inc_month_msg(m: Message):
+    """
+    +1 к счётчику сообщений за текущий месяц для ЛЮБОГО пользовательского сообщения
+    (кроме команд). Вызывать из текстового и нетекстовых хэндлеров.
+    """
+    if not m or not m.from_user:
+        return
+    if m.text and is_bot_command(m):
+        return  # команды не считаем
+
+    uid = m.from_user.id
+    # Обновим карточку пользователя (для редкости/имен)
+    full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
+    db_execute(
+        "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
+        (uid, full_name, m.from_user.username)
+    )
+
+    k = month_key("msg:month")          # ВАЖНО: конкретный ключ с YYYY-MM
+    inc_counter(uid, k, 1)
+    await check_achievements_for_user(uid, m, updated_keys=[k])
+
+
+def is_bot_command(m: Message) -> bool:
+    """
+    Точно определяем команду: entity type=bot_command в начале текста.
+    Надёжнее, чем просто m.text.startswith('/').
+    """
+    if not m or not getattr(m, "entities", None) or not m.text:
+        return False
+    for e in m.entities:
+        if e.type == "bot_command" and e.offset == 0:
+            return True
+    return False
+
+
 def get_all_families():
     """
     Возвращает словарь {(type,key): [rows...]}, где rows — список ачивок семьи по threshold ASC.
@@ -1084,6 +1121,17 @@ async def cmd_ach_debug(m: Message):
         disable_web_page_preview=True
     )
 
+@dp.message(
+    F.sticker | F.photo | F.audio | F.document | F.animation |
+    F.video | F.video_note | F.voice | F.contact | F.location |
+    F.poll | F.dice
+)
+async def on_any_nontext(m: Message):
+    # просто считаем как «сообщение за месяц»
+    await _inc_month_msg(m)
+    # (доп.логики здесь не нужно; отдельные ачивки — в своих хэндлерах)
+
+
 @dp.message(Command("ach_progress"))
 async def cmd_ach_progress(m: Message):
     """
@@ -1273,31 +1321,37 @@ async def on_voice(m: Message):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(m: Message):
-    # далее — твой существующий код on_text без первых трёх строк-проверок
     if not m.text:
         return
 
-    # логируем текст
-    if not m.text.startswith("/"):
+    # логируем текст (как у тебя было)
+    db_execute(
+        "INSERT INTO messages(chat_id, user_id, username, text, created_at, message_id) VALUES (?, ?, ?, ?, ?, ?);",
+        (m.chat.id, m.from_user.id if m.from_user else 0,
+         m.from_user.username if m.from_user else None,
+         m.text, now_ts(), m.message_id)
+    )
+    # обновляем users (как у тебя было)
+    if m.from_user:
+        full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
         db_execute(
-            "INSERT INTO messages(chat_id, user_id, username, text, created_at, message_id) VALUES (?, ?, ?, ?, ?, ?);",
-            (m.chat.id, m.from_user.id if m.from_user else 0,
-             m.from_user.username if m.from_user else None,
-             m.text, now_ts(), m.message_id)
+            "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
+            (m.from_user.id, full_name, m.from_user.username)
         )
-        # — обновляем карточку пользователя (для кликабельных имён и метрик)
-        if m.from_user:
-            full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
-            db_execute(
-                "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
-                "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
-                (m.from_user.id, full_name, m.from_user.username)
-            )
-            # инкремент универсального счётчика сообщений (для будущих ачивок типа MSG100)
-            inc_counter(m.from_user.id, "msg:total", 1)
-            # можно проверять ачивки, если появятся, завязанные на msg:total
-            # await check_achievements_for_user(m.from_user.id, m, updated_keys=["msg:total"])
 
+    # >>> ДОБАВЬ ЭТУ СТРОКУ: считаем сообщение за месяц <<<
+    await _inc_month_msg(m)
+
+    me = await bot.get_me()
+
+    if m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id:
+        await reply_to_thread(m); return
+
+    if mentions_bot(m.text or "", me.username):
+        await reply_to_mention(m); return
+
+    await maybe_interject(m)
     me = await bot.get_me()
 
     if m.text.startswith("/"):
