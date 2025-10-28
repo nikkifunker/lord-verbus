@@ -57,28 +57,28 @@ def define_achievements() -> list[dict]:
             "meta": None,
         },
                 # ===== PACK 1: Стикеры (всего за всё время) =====
-        {"code":"STK50","title":"Стикер-ученик","description":"Отправил 50 стикеров",
+        {"code":"STK50","title":"Стикер-спамер","description":"Отправил 50 стикеров",
          "emoji":"🥉","type":"counter_at_least","key":"sticker:total","threshold":50,"active":1,"meta":None},
-        {"code":"STK500","title":"Стикер-мастер","description":"Отправил 500 стикеров",
+        {"code":"STK500","title":"Мастер стикер-спама","description":"Отправил 500 стикеров",
          "emoji":"🥈","type":"counter_at_least","key":"sticker:total","threshold":500,"active":1,"meta":None},
-        {"code":"STK5000","title":"Стикер-король","description":"Отправил 5000 стикеров",
+        {"code":"STK5000","title":"Даша, ну ты и ебанутая","description":"Отправила 5000 стикеров",
          "emoji":"🥇","type":"counter_at_least","key":"sticker:total","threshold":5000,"active":1,"meta":None},
 
         # ===== PACK 2: Сообщения за месяц =====
         # type=counter_at_least_monthly: в поле key кладём ПРЕФИКС, реальный ключ строится как key:YYYY-MM
-        {"code":"MSGM100","title":"Голос чата (бронза)","description":"100 сообщений за месяц",
+        {"code":"MSGM100","title":"Залетный хуй","description":"Всего 100 сообщений за месяц, ничтожество",
          "emoji":"🥉","type":"counter_at_least_monthly","key":"msg:month","threshold":100,"active":1,"meta":None},
-        {"code":"MSGM1000","title":"Голос чата (серебро)","description":"1000 сообщений за месяц",
+        {"code":"MSGM1000","title":"Завсегдатай чата","description":"1000 сообщений за месяц, можно уважать",
          "emoji":"🥈","type":"counter_at_least_monthly","key":"msg:month","threshold":1000,"active":1,"meta":None},
-        {"code":"MSGM5000","title":"Голос чата (золото)","description":"5000 сообщений за месяц",
+        {"code":"MSGM5000","title":"Как же я люблю попиздеть","description":"5000 сообщений за месяц, ебанутое создание!",
          "emoji":"🥇","type":"counter_at_least_monthly","key":"msg:month","threshold":5000,"active":1,"meta":None},
 
         # ===== PACK 3: Голосовые за месяц =====
-        {"code":"VOIM10","title":"Голос волн (бронза)","description":"10 голосовых за месяц",
+        {"code":"VOIM10","title":"Любитель потрещать","description":"Высрал/-а 10 голосовых за месяц",
          "emoji":"🥉","type":"counter_at_least_monthly","key":"voice:month","threshold":10,"active":1,"meta":None},
-        {"code":"VOIM100","title":"Голос волн (серебро)","description":"100 голосовых за месяц",
+        {"code":"VOIM100","title":"Да закрой ты варежку","description":"100 голосовых за месяц",
          "emoji":"🥈","type":"counter_at_least_monthly","key":"voice:month","threshold":100,"active":1,"meta":None},
-        {"code":"VOIM1000","title":"Голос волн (золото)","description":"1000 голосовых за месяц",
+        {"code":"VOIM1000","title":"Конченая мразь","description":"1000 голосовых за месяц, не, ну это пиздец. Нет слов, вызывайте дурку!",
          "emoji":"🥇","type":"counter_at_least_monthly","key":"voice:month","threshold":1000,"active":1,"meta":None},
 
         # Примеры для будущего:
