@@ -69,8 +69,8 @@ def define_achievements() -> list[dict]:
          "emoji":"🥇","type":"counter_at_least","key":"sticker:total","threshold":5000,"active":1,"meta":None},
 
         # ===== PACK 2: Сообщения за месяц (учитываем все НЕ-командные события) =====
-        {"code":"MSGM100","title":"Залетный хуй","description":"Всего 100 сообщений за месяц, ничтожество",
-         "emoji":"🥉","type":"counter_at_least_monthly","key":"msg:month","threshold":100,"active":1,"meta":None},
+        {"code":"MSGM150","title":"Залетный хуй","description":"Всего 100 сообщений за месяц, ничтожество",
+         "emoji":"🥉","type":"counter_at_least_monthly","key":"msg:month","threshold":150,"active":1,"meta":None},
         {"code":"MSGM1000","title":"Завсегдатай чата","description":"1000 сообщений за месяц, можно уважать",
          "emoji":"🥈","type":"counter_at_least_monthly","key":"msg:month","threshold":1000,"active":1,"meta":None},
         {"code":"MSGM5000","title":"Как же я люблю попиздеть","description":"5000 сообщений за месяц, ебанутое создание!",
