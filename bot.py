@@ -794,8 +794,111 @@ async def start(m: Message):
         "Просто говорите — я вмешаюсь, если нужно."
     )
 
-@dp.message(F.text)
+# =========================
+# Achievements: команды (ДОЛЖНЫ БЫТЬ ВЫШЕ on_text)
+# =========================
+@dp.message(Command("achievements"))
+async def cmd_achievements(m: Message):
+    if not m.from_user:
+        return
+    uid = m.from_user.id
+    rows = db_query(
+        "SELECT a.code, a.title, a.description, a.emoji, ua.earned_at "
+        "FROM user_achievements ua JOIN achievements a ON a.code=ua.code "
+        "WHERE ua.user_id=? ORDER BY ua.earned_at DESC;",
+        (uid,)
+    )
+    total = len(rows)
+    def _styled_achv_counter(n: int) -> str:
+        medals = "🏅" * min(n, 10)
+        tail = f" +{n-10}" if n > 10 else ""
+        return f"{medals}{tail}  <b>{n}</b>"
+    counter = _styled_achv_counter(total)
+    if total == 0:
+        await m.reply("У тебя пока нет ачивок. Продолжай — судьба любит настойчивых.")
+        return
+    def _achv_rarity_percent(code: str) -> float:
+        holders = db_query("SELECT COUNT(DISTINCT user_id) FROM user_achievements WHERE code=?;", (code,))
+        users_cnt = db_query("SELECT COUNT(*) FROM users;")
+        pop = max(int(users_cnt[0][0]) if users_cnt else 1, 1)
+        return round(100.0 * (int(holders[0][0]) if holders else 0) / pop, 2)
+    lines = [f"🏆 Твои ачивки: {counter}\n"]
+    for code, title, desc, emoji, ts in rows:
+        rarity = _achv_rarity_percent(code)
+        when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        lines.append(
+            f"{emoji} <b>{_html.escape(title)}</b>  "
+            f"<i>{rarity}%</i>\n"
+            f"— {_html.escape(desc)}  ·  <span class='tg-spoiler'>{when}</span>"
+        )
+    await m.reply("\n".join(lines), disable_web_page_preview=True)
+
+@dp.message(Command("achievements_top"))
+async def cmd_achievements_top(m: Message):
+    rows = db_query(
+        "SELECT ua.user_id, COUNT(*) as cnt "
+        "FROM user_achievements ua "
+        "GROUP BY ua.user_id "
+        "ORDER BY cnt DESC, MIN(ua.earned_at) ASC "
+        "LIMIT 10;"
+    )
+    if not rows:
+        await m.reply("Топ пуст. Пора уже кому-то заработать первую ачивку.")
+        return
+    ids = tuple(r[0] for r in rows)
+    placeholders = ",".join(["?"] * len(ids)) if ids else ""
+    users = {}
+    if ids:
+        urows = db_query(f"SELECT user_id, display_name, username FROM users WHERE user_id IN ({placeholders});", ids)
+        for uid, dn, un in urows:
+            users[uid] = (dn, un)
+    def tg_mention(uid: int, dn: str|None, un: str|None) -> str:
+        name = (dn or un or "гость").strip()
+        return f"<a href=\"tg://user?id={uid}\">{_html.escape(name)}</a>"
+    out = ["<b>🏆 ТОП по ачивкам</b>\n"]
+    rank = 1
+    for uid, cnt in rows:
+        dn, un = users.get(uid, (None, None))
+        out.append(f"{rank}. {tg_mention(uid, dn, un)} — <b>{cnt}</b> {('🏅'*min(cnt,5))}")
+        rank += 1
+    await m.reply("\n".join(out), disable_web_page_preview=True)
+
+# Диагностика
+@dp.message(Command("ach_debug"))
+async def cmd_ach_debug(m: Message):
+    if not m.from_user:
+        return
+    uid = m.from_user.id
+    full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
+    db_execute(
+        "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
+        (uid, full_name, m.from_user.username)
+    )
+    row = db_query("SELECT value FROM user_counters WHERE user_id=? AND key=?;", (uid, "cmd:/q"))
+    q_cnt = int(row[0][0]) if row else 0
+    has_q10 = bool(db_query("SELECT 1 FROM user_achievements WHERE user_id=? AND code='Q10' LIMIT 1;", (uid,)))
+    await m.reply(
+        f"🔍 Debug:\n"
+        f"• cmd:/q = <b>{q_cnt}</b>\n"
+        f"• Q10 выдана: <b>{'да' if has_q10 else 'нет'}</b>\n"
+        f"(Порог Q10: 10 раз /q)",
+        disable_web_page_preview=True
+    )
+
+# Алиасы на опечатки: /achievments, /achievments_top
+@dp.message(Command("achievments"))
+async def _alias_achievments(m: Message):
+    await cmd_achievements(m)
+
+@dp.message(Command("achievments_top"))
+async def _alias_achievments_top(m: Message):
+    await cmd_achievements_top(m)
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(m: Message):
+    # далее — твой существующий код on_text без первых трёх строк-проверок
     if not m.text:
         return
 
@@ -835,88 +938,6 @@ async def on_text(m: Message):
 
     await maybe_interject(m)
 
-@dp.message(Command("ach_debug"))
-async def cmd_ach_debug(m: Message):
-    if not m.from_user:
-        return
-    uid = m.from_user.id
-    # подгрузим имя в users (чтобы не было пусто)
-    full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
-    db_execute(
-        "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
-        (uid, full_name, m.from_user.username)
-    )
-
-    # считаем текущие значения
-    row = db_query("SELECT value FROM user_counters WHERE user_id=? AND key=?;", (uid, "cmd:/q"))
-    q_cnt = int(row[0][0]) if row else 0
-    has_q10 = bool(db_query("SELECT 1 FROM user_achievements WHERE user_id=? AND code='Q10' LIMIT 1;", (uid,)))
-    await m.reply(
-        f"🔍 Debug:\n"
-        f"• cmd:/q = <b>{q_cnt}</b>\n"
-        f"• Q10 выдана: <b>{'да' if has_q10 else 'нет'}</b>\n"
-        f"(Порог Q10: 10 раз /q)",
-        disable_web_page_preview=True
-    )
-
-
-# =========================
-# Achievements: команды
-# =========================
-@dp.message(Command("achievements"))
-async def cmd_achievements(m: Message):
-    if not m.from_user:
-        return
-    uid = m.from_user.id
-    rows = db_query(
-        "SELECT a.code, a.title, a.description, a.emoji, ua.earned_at "
-        "FROM user_achievements ua JOIN achievements a ON a.code=ua.code "
-        "WHERE ua.user_id=? ORDER BY ua.earned_at DESC;",
-        (uid,)
-    )
-    total = len(rows)
-    counter = _styled_achv_counter(total)
-    if total == 0:
-        await m.reply("У тебя пока нет ачивок. Продолжай — судьба любит настойчивых.")
-        return
-    lines = [f"🏆 Твои ачивки: {counter}\n"]
-    for code, title, desc, emoji, ts in rows:
-        rarity = _achv_rarity_percent(code)
-        when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        lines.append(
-            f"{emoji} <b>{_html.escape(title)}</b>  "
-            f"<i>{rarity}%</i>\n"
-            f"— {_html.escape(desc)}  ·  <span class='tg-spoiler'>{when}</span>"
-        )
-    await m.reply("\n".join(lines), disable_web_page_preview=True)
-
-@dp.message(Command("achievements_top"))
-async def cmd_achievements_top(m: Message):
-    rows = db_query(
-        "SELECT ua.user_id, COUNT(*) as cnt "
-        "FROM user_achievements ua "
-        "GROUP BY ua.user_id "
-        "ORDER BY cnt DESC, MIN(ua.earned_at) ASC "
-        "LIMIT 10;"
-    )
-    if not rows:
-        await m.reply("Топ пуст. Пора уже кому-то заработать первую ачивку.")
-        return
-    ids = tuple(r[0] for r in rows)
-    placeholders = ",".join(["?"] * len(ids)) if ids else ""
-    users = {}
-    if ids:
-        urows = db_query(f"SELECT user_id, display_name, username FROM users WHERE user_id IN ({placeholders});", ids)
-        for uid, dn, un in urows:
-            users[uid] = (dn, un)
-    out = ["<b>🏆 ТОП по ачивкам</b>\n"]
-    rank = 1
-    for uid, cnt in rows:
-        dn, un = users.get(uid, (None, None))
-        out.append(f"{rank}. {tg_mention(uid, dn, un)} — <b>{cnt}</b> {('🏅'*min(cnt,5))}")
-        rank += 1
-    await m.reply("\n".join(out), disable_web_page_preview=True)
 
 # =========================
 # Трекинг /q → универсальный счётчик + проверка правил
