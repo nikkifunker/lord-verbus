@@ -1121,15 +1121,26 @@ async def cmd_ach_debug(m: Message):
         disable_web_page_preview=True
     )
 
-@dp.message(
-    F.sticker | F.photo | F.audio | F.document | F.animation |
-    F.video | F.video_note | F.voice | F.contact | F.location |
-    F.poll | F.dice
-)
-async def on_any_nontext(m: Message):
-    # просто считаем как «сообщение за месяц»
-    await _inc_month_msg(m)
-    # (доп.логики здесь не нужно; отдельные ачивки — в своих хэндлерах)
+@dp.message()  # без фильтра — сами проверим тип
+async def _on_sticker_safe(m: Message):
+    # обрабатываем только сообщения-стикеры
+    if not getattr(m, "sticker", None):
+        return
+    if not m.from_user:
+        return
+
+    uid = m.from_user.id
+    # карточка пользователя — чтобы считалась "редкость"
+    full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
+    db_execute(
+        "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
+        (uid, full_name, m.from_user.username)
+    )
+
+    # инкремент подсчёта стикеров (всего)
+    inc_counter(uid, "sticker:total", 1)
+    await check_achievements_for_user(uid, m, updated_keys=["sticker:total"])
 
 
 @dp.message(Command("ach_progress"))
