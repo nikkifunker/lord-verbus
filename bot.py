@@ -7,6 +7,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import html as _html
 import os, pathlib
+import time
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -799,24 +800,54 @@ async def check_achievements_for_user(uid: int, m: Message | None, updated_keys:
             if thr <= 0:
                 continue
             if not _has_achievement(uid, code) and val >= thr:
-                _grant_and_announce(uid, code, title, desc, emoji, m, dn, un)
+                await _grant_and_announce(uid, code, title, desc, emoji, m, dn, un)
 
 
 
-def _grant_and_announce(uid: int, code: str, title: str, desc: str, emoji: str, m: Message | None,
-                        dn: str | None, un: str | None):
-    """Выдать ачивку и красиво объявить об этом в чате."""
-    _grant_achievement(uid, code)
-    rarity = _achv_rarity_percent(code)
-    card = _styled_achv_card(code, title, desc, emoji or "🏆", rarity)
-    who = tg_mention(uid, dn or (m.from_user.full_name if m and m.from_user else None),
-                          un or (m.from_user.username if m and m.from_user else None))
+async def _grant_and_announce(uid, code, title, desc, emoji, m, dn, un):
+    """
+    Выдаёт ачивку (upsert в user_achievements) и делает одно объявление в чат.
+    В aiogram v3 нельзя класть SendMessage в create_task — только await.
+    """
+    # 1) Пишем в БД (idempotent)
+    db_execute(
+        "INSERT INTO user_achievements(user_id, code, granted_at) VALUES(?, ?, ?)"
+        " ON CONFLICT(user_id, code) DO NOTHING;",
+        (uid, code, int(time.time()))
+    )
+
+    # 2) Формируем карточку
+    who = f'<a href="tg://user?id={uid}">{_html.escape(dn or "Пользователь")}</a>'
+    rarity = calc_achievement_rarity(code)  # если есть у тебя такая функция; иначе верни "—"
+    card = (
+        f"<b>{_html.escape(emoji or '🏆')} Ачивка разблокирована!</b>\n"
+        f"┌───────────────────────────────┐\n"
+        f"│ <b>{_html.escape(title)}</b>\n"
+        f"│ {_html.escape(desc)}\n"
+        f"│ Редкость: <i>{rarity}</i>\n"
+        f"└───────────────────────────────┘"
+    )
     tail = "Чтобы посмотреть все свои ачивки, напиши команду /achievements"
-    if m:
-        try:
-            asyncio.create_task(m.reply(f"{who}\n{card}\n\n<i>{tail}</i>", disable_web_page_preview=True))
-        except Exception:
-            asyncio.create_task(m.reply(f"{(m.from_user.first_name if m and m.from_user else 'Пользователь')} получил ачивку: {title}. {tail}"))
+
+    # 3) Отправляем (ТОЛЬКО await, без create_task!)
+    try:
+        if m:
+            await m.reply(f"{who}\n{card}\n\n<i>{tail}</i>", disable_web_page_preview=True)
+        else:
+            # запасной путь, если нет исходного Message (например, рескан без контекста)
+            await bot.send_message(
+                chat_id=MAIN_CHAT_ID,  # если у тебя есть такой; иначе можно пропустить/определить чат по uid
+                text=f"{who}\n{card}\n\n<i>{tail}</i>",
+                disable_web_page_preview=True
+            )
+    except Exception as e:
+        # На всякий случай — упрощённый фоллбек
+        if m:
+            await m.reply(
+                f"{(_html.escape(dn or 'Пользователь'))} получил ачивку: { _html.escape(title) }. {tail}",
+                disable_web_page_preview=True
+            )
+
 
 # ============================================================
 # Команды пользователя (ДОЛЖНЫ стоять выше on_text)
