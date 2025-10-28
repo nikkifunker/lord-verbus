@@ -1025,6 +1025,70 @@ async def cmd_ach_progress(m: Message):
     text = "\n".join(lines).strip() or "Нет данных для отображения."
     await m.reply(text, disable_web_page_preview=True)
 
+@dp.message(Command("ach_rescan"))
+async def cmd_ach_rescan(m: Message):
+    """
+    /ach_rescan                 — пересчитать и ДОвыдать ачивки только себе
+    /ach_rescan <@user|user_id> — пересчитать для указанного пользователя
+    /ach_rescan all             — пересчитать для всех пользователей
+    Видит только ADMIN_IDS. Ачивки, которых ещё не было — будут выданы с объявлениями.
+    """
+    if not m.from_user or m.from_user.id not in ADMIN_IDS:
+        return  # скрытая админ-команда
+
+    arg = (m.text or "").split(maxsplit=1)
+    target = (arg[1].strip() if len(arg) == 2 else None) or str(m.from_user.id)
+
+    # Собираем список user_id для ресканинга
+    user_ids: list[int] = []
+    if target.lower() == "all":
+        rows = db_query("SELECT DISTINCT user_id FROM users;")
+        user_ids = [int(r[0]) for r in rows] if rows else []
+        if not user_ids:
+            await m.reply("Пользователи не найдены."); return
+    else:
+        # либо @username, либо raw id
+        if target.startswith("@"):
+            uname = target[1:]
+            row = db_query("SELECT user_id FROM users WHERE username=? LIMIT 1;", (uname,))
+            if not row:
+                await m.reply(f"Пользователь @{uname} не найден в базе."); return
+            user_ids = [int(row[0][0])]
+        else:
+            try:
+                user_ids = [int(target)]
+            except ValueError:
+                await m.reply("Ожидал @username или user_id или all."); return
+
+    # Рескан по каждому пользователю
+    total_granted = 0
+    for uid in user_ids:
+        # Ключи, которые «считаются изменёнными» — чтобы триггернуть проверку всех ачивок этого юзера
+        keys_rows = db_query("SELECT DISTINCT key FROM user_counters WHERE user_id=?;", (uid,))
+        updated_keys = [r[0] for r in (keys_rows or [])]
+
+        # Дополнительно на всякий случай добавим свежие ежемесячные ключи для всех известных семейств
+        ach_rows = db_query("SELECT DISTINCT key, type FROM achievements WHERE active=1;")
+        for k, at in (ach_rows or []):
+            if at == "counter_at_least_monthly":
+                mk = month_key(k)
+                if mk not in updated_keys:
+                    updated_keys.append(mk)
+
+        # Перед проверкой запомним, сколько было ачивок
+        before_cnt = db_query("SELECT COUNT(*) FROM user_achievements WHERE user_id=?;", (uid,))
+        before = int(before_cnt[0][0]) if before_cnt else 0
+
+        await check_achievements_for_user(uid, m, updated_keys=updated_keys)
+
+        after_cnt = db_query("SELECT COUNT(*) FROM user_achievements WHERE user_id=?;", (uid,))
+        after = int(after_cnt[0][0]) if after_cnt else 0
+        total_granted += max(after - before, 0)
+
+    who = "всем" if target.lower() == "all" else (target)
+    await m.reply(f"Рескан завершён ({who}). Выдано новых ачивок: <b>{total_granted}</b>.", disable_web_page_preview=True)
+
+
 # ============================================================
 # Хэндлеры событий (стикеры/войсы/тексты) — считать counters и выдавать ачивки
 # ============================================================
