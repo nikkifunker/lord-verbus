@@ -764,10 +764,11 @@ async def check_achievements_for_user(uid: int, m: Message | None, updated_keys:
 
         elif atype == "counter_at_least_monthly":
             current_key = month_key(key_field)
-            if current_key not in updated_keys:
+            if current_key not in updated_keys and key_field not in updated_keys:
                 continue
             if _get_counter(uid, current_key) >= int(threshold or 0):
                 _grant_and_announce(uid, code, title, desc, emoji, m, dn, un)
+
 
 def _grant_and_announce(uid: int, code: str, title: str, desc: str, emoji: str, m: Message | None,
                         dn: str | None, un: str | None):
