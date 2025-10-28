@@ -56,6 +56,31 @@ def define_achievements() -> list[dict]:
             "active": 1,
             "meta": None,
         },
+                # ===== PACK 1: Стикеры (всего за всё время) =====
+        {"code":"STK50","title":"Стикер-ученик","description":"Отправил 50 стикеров",
+         "emoji":"🥉","type":"counter_at_least","key":"sticker:total","threshold":50,"active":1,"meta":None},
+        {"code":"STK500","title":"Стикер-мастер","description":"Отправил 500 стикеров",
+         "emoji":"🥈","type":"counter_at_least","key":"sticker:total","threshold":500,"active":1,"meta":None},
+        {"code":"STK5000","title":"Стикер-король","description":"Отправил 5000 стикеров",
+         "emoji":"🥇","type":"counter_at_least","key":"sticker:total","threshold":5000,"active":1,"meta":None},
+
+        # ===== PACK 2: Сообщения за месяц =====
+        # type=counter_at_least_monthly: в поле key кладём ПРЕФИКС, реальный ключ строится как key:YYYY-MM
+        {"code":"MSGM100","title":"Голос чата (бронза)","description":"100 сообщений за месяц",
+         "emoji":"🥉","type":"counter_at_least_monthly","key":"msg:month","threshold":100,"active":1,"meta":None},
+        {"code":"MSGM1000","title":"Голос чата (серебро)","description":"1000 сообщений за месяц",
+         "emoji":"🥈","type":"counter_at_least_monthly","key":"msg:month","threshold":1000,"active":1,"meta":None},
+        {"code":"MSGM5000","title":"Голос чата (золото)","description":"5000 сообщений за месяц",
+         "emoji":"🥇","type":"counter_at_least_monthly","key":"msg:month","threshold":5000,"active":1,"meta":None},
+
+        # ===== PACK 3: Голосовые за месяц =====
+        {"code":"VOIM10","title":"Голос волн (бронза)","description":"10 голосовых за месяц",
+         "emoji":"🥉","type":"counter_at_least_monthly","key":"voice:month","threshold":10,"active":1,"meta":None},
+        {"code":"VOIM100","title":"Голос волн (серебро)","description":"100 голосовых за месяц",
+         "emoji":"🥈","type":"counter_at_least_monthly","key":"voice:month","threshold":100,"active":1,"meta":None},
+        {"code":"VOIM1000","title":"Голос волн (золото)","description":"1000 голосовых за месяц",
+         "emoji":"🥇","type":"counter_at_least_monthly","key":"voice:month","threshold":1000,"active":1,"meta":None},
+
         # Примеры для будущего:
         # {"code":"MSG100","title":"Голос чата","description":"100 сообщений",
         #  "emoji":"💬","type":"counter_at_least","key":"msg:total","threshold":100,"active":1,"meta":None},
@@ -237,6 +262,15 @@ QUESTION_PATTERNS = [
     r"\bсколько\b", r"\bможно ли\b", r"\bесть ли\b"
 ]
 QUESTION_RE = re.compile("|".join(QUESTION_PATTERNS), re.IGNORECASE)
+
+def month_key(prefix: str, dt: datetime | None = None) -> str:
+    """
+    Строит ключ счётчика за текущий месяц: prefix:YYYY-MM
+    Пример: month_key("msg:month") -> "msg:month:2025-10"
+    """
+    d = dt or datetime.now(timezone.utc)
+    return f"{prefix}:{d.strftime('%Y-%m')}"
+
 
 def is_question(text: str) -> bool:
     return bool(text and QUESTION_RE.search(text))
@@ -753,32 +787,52 @@ def _grant_achievement(user_id: int, code: str) -> None:
 async def check_achievements_for_user(uid: int, m: Message | None, updated_keys: list[str]) -> None:
     """
     Общая точка проверки: вызывай после инкремента счётчиков.
-    updated_keys — список ключей, которые сейчас изменились (для быстрой фильтрации).
+    updated_keys — список КОНКРЕТНЫХ ключей, которые только что изменились.
+    Примеры updated_keys: ["sticker:total"], ["msg:month:2025-10"], ["voice:month:2025-10"]
     """
     achs = db_query("SELECT code, title, description, emoji, type, key, threshold, active FROM achievements WHERE active=1;")
     if not achs:
         return
+
+    # имя/юзернейм для упоминания
     dn, un = None, None
     urow = db_query("SELECT display_name, username FROM users WHERE user_id=? LIMIT 1;", (uid,))
     if urow:
         dn, un = urow[0]
-    for code, title, desc, emoji, atype, key, threshold, active in achs:
+
+    for code, title, desc, emoji, atype, key_field, threshold, active in achs:
+        if _has_achievement(uid, code):
+            continue
+
         if atype == "counter_at_least":
-            if key not in updated_keys:
+            # фиксированный ключ
+            if key_field not in updated_keys:
                 continue
-            if _has_achievement(uid, code):
+            if _get_counter(uid, key_field) >= int(threshold or 0):
+                _grant_and_announce(uid, code, title, desc, emoji, m, dn, un)
+
+        elif atype == "counter_at_least_monthly":
+            # key_field — это ПРЕФИКС; реальный ключ = prefix:YYYY-MM
+            current_key = month_key(key_field)
+            if current_key not in updated_keys:
                 continue
-            if _get_counter(uid, key) >= int(threshold or 0):
-                _grant_achievement(uid, code)
-                rarity = _achv_rarity_percent(code)
-                card = _styled_achv_card(code, title, desc, emoji or "🏆", rarity)
-                who = tg_mention(uid, dn or (m.from_user.full_name if m and m.from_user else None), un or (m.from_user.username if m and m.from_user else None))
-                tail = "Чтобы посмотреть все свои ачивки, напиши команду /achievements"
-                if m:
-                    try:
-                        await m.reply(f"{who}\n{card}\n\n<i>{tail}</i>", disable_web_page_preview=True)
-                    except Exception:
-                        await m.reply(f"{(m.from_user.first_name if m and m.from_user else 'Пользователь')} получил ачивку: {title}. {tail}")
+            if _get_counter(uid, current_key) >= int(threshold or 0):
+                _grant_and_announce(uid, code, title, desc, emoji, m, dn, un)
+
+def _grant_and_announce(uid: int, code: str, title: str, desc: str, emoji: str, m: Message | None,
+                        dn: str | None, un: str | None):
+    _grant_achievement(uid, code)
+    rarity = _achv_rarity_percent(code)
+    card = _styled_achv_card(code, title, desc, emoji or "🏆", rarity)
+    who = tg_mention(uid, dn or (m.from_user.full_name if m and m.from_user else None),
+                          un or (m.from_user.username if m and m.from_user else None))
+    tail = "Чтобы посмотреть все свои ачивки, напиши команду /achievements"
+    if m:
+        try:
+            asyncio.create_task(m.reply(f"{who}\n{card}\n\n<i>{tail}</i>", disable_web_page_preview=True))
+        except Exception:
+            asyncio.create_task(m.reply(f"{(m.from_user.first_name if m and m.from_user else 'Пользователь')} получил ачивку: {title}. {tail}"))
+
 
 # =========================
 # Handlers
@@ -894,6 +948,41 @@ async def _alias_achievments(m: Message):
 @dp.message(Command("achievments_top"))
 async def _alias_achievments_top(m: Message):
     await cmd_achievements_top(m)
+
+@dp.message(F.sticker)
+async def on_sticker(m: Message):
+    if not m.from_user:
+        return
+    uid = m.from_user.id
+    # карточка пользователя — чтобы считалась редкость
+    full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
+    db_execute(
+        "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
+        (uid, full_name, m.from_user.username)
+    )
+    inc_counter(uid, "sticker:total", 1)
+    await check_achievements_for_user(uid, m, updated_keys=["sticker:total"])
+
+@dp.message(F.voice)
+async def on_voice(m: Message):
+    if not m.from_user:
+        return
+    uid = m.from_user.id
+    full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
+    db_execute(
+        "INSERT INTO users(user_id, display_name, username) VALUES(?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET display_name=excluded.display_name, username=excluded.username;",
+        (uid, full_name, m.from_user.username)
+    )
+    k = month_key("voice:month")
+    inc_counter(uid, k, 1)
+    await check_achievements_for_user(uid, m, updated_keys=[k])
+
+    # +1 к счётчику сообщений за текущий месяц
+    k = month_key("msg:month")
+    inc_counter(m.from_user.id, k, 1)
+    await check_achievements_for_user(m.from_user.id, m, updated_keys=[k])
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
