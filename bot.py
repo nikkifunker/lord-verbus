@@ -739,49 +739,58 @@ def _grant_achievement(user_id: int, code: str) -> None:
     """Выдать ачивку (идемпотентно)."""
     db_execute("INSERT OR IGNORE INTO user_achievements(user_id, code, earned_at) VALUES (?, ?, ?);", (user_id, code, now_ts()))
 
-async def check_achievements_for_user(uid: int, m: Message | None, updated_keys: list[str]) -> None:
+def check_achievements_for_user(uid: int, m: Message | None, updated_keys: list[str]) -> None:
     """
     Центральная проверка: вызывай ПОСЛЕ инкремента счётчиков.
+    Работает ПО СЕМЕЙСТВАМ: для каждого (type, key) проверяются все пороги (tiers)
+    по возрастанию и выдаются ВСЕ недостающие ступени, на которые хватает значения.
+    В monthly-семействах ключ строится через month_key(key).
     updated_keys — список конкретных ключей, которые только что изменились (например "sticker:total" или "msg:month:2025-10").
+    Принимаем также «сырой» ключ семейства (например "msg:month"), чтобы ресканы не промахивались.
     """
-    achs = db_query("SELECT code, title, description, emoji, type, key, threshold, active FROM achievements WHERE active=1;")
-    if not achs: return
+    achs = db_query(
+        "SELECT code, title, description, emoji, type, key, threshold "
+        "FROM achievements WHERE active=1;"
+    )
+    if not achs:
+        return
 
-    # данные для красивого упоминания
+    # Имя/юзернейм для красивого упоминания
     dn, un = None, None
     urow = db_query("SELECT display_name, username FROM users WHERE user_id=? LIMIT 1;", (uid,))
-    if urow: dn, un = urow[0]
+    if urow:
+        dn, un = urow[0]
 
-        # Группируем ачивки по семействам (type + key)
+    # Сгруппировать по семействам: (type, key) -> [(code, title, desc, emoji, thr), ...]
     families: dict[tuple[str, str], list[tuple[str, str, str, str, int]]] = {}
-    for code, title, desc, emoji, atype, key_field, threshold, active in achs:
+    for code, title, desc, emoji, atype, key_field, threshold in achs:
         families.setdefault((atype, key_field), []).append(
             (code, title, desc, emoji, int(threshold or 0))
         )
 
-    # Для каждого семейства проверяем пороги по возрастанию
+    # Для каждого семейства: рассчитать реальный ключ (учитывая monthly), проверить пороги
     for (atype, key_field), rows in families.items():
-        # Вычисляем «реальный» ключ счётчика (учитывая YYYY-MM для monthly)
+        # Определяем реальный ключ счётчика
         if atype == "counter_at_least_monthly":
             real_key = month_key(key_field)
         else:
             real_key = key_field
 
-        # Триггер: ресканим семейством только если изменился нужный ключ
-        # (принимаем и конкретный real_key, и «сырой» префикс на случай кривого updated_keys)
+        # Триггер по updated_keys: допускаем как real_key, так и «сырой» family key
         if (real_key not in updated_keys) and (key_field not in updated_keys):
             continue
 
-        # Текущее значение счётчика
+        # Текущее значение
         val = _get_counter(uid, real_key)
 
-        # Проверяем пороги от меньшего к большему и выдаём все недостающие
+        # Проверяем пороги по возрастанию и выдаём всё, чего ещё нет
         rows_sorted = sorted(rows, key=lambda r: r[4])  # r[4] = threshold
         for code, title, desc, emoji, thr in rows_sorted:
             if thr <= 0:
                 continue
             if not _has_achievement(uid, code) and val >= thr:
                 _grant_and_announce(uid, code, title, desc, emoji, m, dn, un)
+
 
 
 def _grant_and_announce(uid: int, code: str, title: str, desc: str, emoji: str, m: Message | None,
