@@ -1154,7 +1154,7 @@ async def cmd_ach_reset_counters(m: Message):
     db_execute("DELETE FROM user_counters WHERE user_id=?;", (uid,))
     await m.reply(f"Счётчики пользователя <code>{uid}</code> сброшены.", disable_web_page_preview=True)
 
-@dp.message(Command("ach_editstat")))
+@dp.message(Command("ach_editstat"))
 async def cmd_ach_editstat(m: Message):
     """
     /ach_editstat @username ACH_CODE NEW_VALUE
