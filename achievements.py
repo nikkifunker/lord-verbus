@@ -462,25 +462,31 @@ async def cmd_ach_progress(m: Message, command: CommandObject):
     """
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
+    
     code = (command.args or "").strip()
     if not code:
         return await m.reply("Укажите code или id ачивки.")
+    
     ach = _find_achievement_by_code_or_id(code)
-if not ach:
-    return await m.reply("Ачивка не найдена.")
-(aid, _, title, _, kind, ctype, thr_json, target_ts, active, extra_json) = ach
-try:
-    thresholds = sorted(set(map(int, json.loads(thr_json)))) if thr_json else []
-except Exception:
-    thresholds = []
+    if not ach:
+        return await m.reply("Ачивка не найдена.")
+    
+    # распаковка с 10 полями
+    (aid, _, title, _, kind, ctype, thr_json, target_ts, active, extra_json) = ach
 
-    # Вытащим всех говоривших в этом чате + их счётчик
+    try:
+        thresholds = sorted(set(map(int, json.loads(thr_json)))) if thr_json else []
+    except Exception:
+        thresholds = []
+
+    # Вытащим всех говоривших в этом чате + их счётчик сообщений
     rows = _q("""
         SELECT s.user_id, s.messages_count
         FROM user_stats s
         WHERE s.chat_id=?
         ORDER BY s.messages_count DESC;
     """, (m.chat.id,))
+    
     if not rows:
         return await m.reply("Пока нет данных по этому чату.")
 
@@ -488,11 +494,11 @@ except Exception:
 
     if ctype == "messages":
         for uid, msg_cnt in rows[:50]:  # ограничим вывод
-            # макс. уже взятый тир
-            taken = _q("SELECT MAX(tier) FROM user_achievements WHERE chat_id=? AND user_id=? AND achievement_id=?;",
-                       (m.chat.id, uid, aid))[0][0]
+            taken = _q("""
+                SELECT MAX(tier) FROM user_achievements
+                WHERE chat_id=? AND user_id=? AND achievement_id=?;
+            """, (m.chat.id, uid, aid))[0][0]
             taken = taken or 0
-            # следующий порог
             next_thr = None
             for i, t in enumerate(sorted(thresholds), start=1):
                 if msg_cnt < t:
@@ -504,9 +510,17 @@ except Exception:
                 nxt = next_thr or "-"
                 status = f"{msg_cnt} / {nxt}"
             lines.append(f"• user_id={uid}: {status}")
+    elif ctype == "keyword":
+        try:
+            kw = json.loads(extra_json).get("keyword") if extra_json else None
+        except Exception:
+            kw = None
+        lines.append(f"Тип: keyword, слово: <code>{kw}</code>")
     else:
         lines.append("Тип: date — выдаётся автоматически после наступления даты при любой активности.")
+    
     await m.reply("\n".join(lines))
+
 
 @router.message(Command("ach_reset"))
 async def cmd_ach_reset(m: Message, command: CommandObject):
