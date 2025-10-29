@@ -4,27 +4,20 @@ import random
 import re
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import html as _html
 import re as _re
-import pathlib
-import logging
+import os, pathlib
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.types import Message, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-# === achievements module (РОУТЕР, init и хук) ===
+# === achievements module (подключаем БЕЗ изменения вашего кода) ===
 from achievements import router as ach_router, init_db as ach_init_db, on_text_hook as ach_on_text_hook
-
-# =========================
-# Логирование
-# =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("lord-verbus.bot")
 
 # =========================
 # Config
@@ -41,15 +34,11 @@ print(f"[DB] Using SQLite at: {os.path.abspath(DB)}")
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ВАЖНО: все «основные» хендлеры теперь в отдельном роутере,
-# чтобы мы могли контролировать порядок подключения (achievements -> core)
-core_router = Router(name="core")
-
 # ID наблюдаемого пользователя (кружки отслеживаем у него)
 WATCH_USER_ID = 447968194   # @daria_mango
 # Кого упоминать/уведомлять
 NOTIFY_USER_ID = 254160871  # @misukhanov
-NOTIFY_USERNAME = "misukhanov"
+NOTIFY_USERNAME = "misukhanov"  # используется только для красивой подписи
 
 # =========================
 # DB
@@ -85,6 +74,7 @@ def init_db():
             INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
         END;
         """)
+        # — таблица пользователей для кликабельных имён в саммари
         conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -101,9 +91,10 @@ def init_db():
         """)
         conn.commit()
 
+# добавляем тонкую обёртку, чтобы ИНИЦИАЛИЗИРОВАТЬ и схемы ачивок
 def init_db_with_achievements():
-    init_db()
-    ach_init_db()
+    init_db()          # ваши базовые таблицы
+    ach_init_db()      # таблицы achievements + миграции внутри модуля
 
 def db_execute(sql: str, params: tuple = ()):
     with closing(sqlite3.connect(DB)) as conn:
@@ -115,8 +106,40 @@ def db_query(sql: str, params: tuple = ()):
         cur = conn.execute(sql, params)
         return cur.fetchall()
 
+def get_user_messages(chat_id: int, user_id: int | None, username: str | None, limit: int = 500):
+    """
+    Возвращает список (text, message_id, created_at) по пользователю.
+    Если есть user_id — ищем по нему. Если нет — пытаемся по username (хуже).
+    """
+    if user_id:
+        return db_query(
+            "SELECT text, message_id, created_at FROM messages WHERE chat_id=? AND user_id=? AND text IS NOT NULL ORDER BY id DESC LIMIT ?;",
+            (chat_id, user_id, limit)
+        )
+    if username:
+        return db_query(
+            "SELECT text, message_id, created_at FROM messages WHERE chat_id=? AND username=? AND text IS NOT NULL ORDER BY id DESC LIMIT ?;",
+            (chat_id, username, limit)
+        )
+    return []
+
+
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
+
+# === Rate limiting for spontaneous replies ===
+LAST_INTERJECT: dict[int, int] = {}  # {chat_id: timestamp последнего "самопроизвольного" ответа}
+
+def can_interject(chat_id: int, cooldown: int = 3600) -> bool:
+    """
+    Возвращает True, если можно вставить реплику (прошёл cooldown в секундах).
+    """
+    now = now_ts()
+    last = LAST_INTERJECT.get(chat_id, 0)
+    if now - last < cooldown:
+        return False
+    LAST_INTERJECT[chat_id] = now
+    return True
 
 # =========================
 # Helpers
@@ -132,21 +155,26 @@ def is_question(text: str) -> bool:
     return bool(text and QUESTION_RE.search(text))
 
 def mentions_bot(text: str, bot_username: str | None) -> bool:
-    if not text or not bot_username:
-        return False
+    if not text or not bot_username: return False
     return f"@{bot_username.lower()}" in text.lower()
 
+def is_quiet_hours(local_dt: datetime) -> bool:
+    return 0 <= local_dt.hour < 7  # 00:00–07:00
+
 def sanitize_html_whitelist(text: str) -> str:
+    # оставляем только безопасные теги
     allowed_tags = {
         "b", "strong", "i", "em", "u", "s", "del", "code", "pre",
         "a", "br", "blockquote", "span"
     }
+    # Безопасно чистим запрещённые теги
     def repl(m):
         tag = m.group(1).lower().strip("/")
         if tag in allowed_tags:
             return m.group(0)
         return _html.escape(m.group(0))
     text = re.sub(r"<\s*/?\s*([a-zA-Z0-9]+)[^>]*>", repl, text)
+    # Пропускаем только href у <a>
     text = re.sub(r"<a\s+([^>]+)>", lambda mm: (
         "<a " + " ".join(
             p for p in mm.group(1).split()
@@ -182,25 +210,37 @@ def tg_mention(user_id: int, display_name: str | None, username: str | None) -> 
     safe = _html.escape(name)
     return f"<a href=\"tg://user?id={user_id}\">{safe}</a>"
 
-# ---- target user resolver
+# ---- target user resolver (по reply, text_mention или @username)
 async def resolve_target_user(m: Message) -> tuple[int | None, str | None, str | None]:
+    """
+    Возвращает (user_id, display_name, username) для цели анализа:
+    - если команда дана в reply — берём автора исходного сообщения
+    - если есть text_mention — берём user.id
+    - если есть @username — пытаемся найти user_id в таблице users
+    """
+    # 1) reply
     if m.reply_to_message and m.reply_to_message.from_user:
         u = m.reply_to_message.from_user
         return u.id, (u.full_name or u.first_name), u.username
+
+    # 2) text_mention
     if m.entities:
         for ent in m.entities:
             if ent.type == "text_mention" and ent.user:
                 u = ent.user
                 return u.id, (u.full_name or u.first_name), u.username
+
+    # 3) @username из текста
     if m.entities:
         for ent in m.entities:
             if ent.type == "mention":
-                uname = (m.text or "")[ent.offset+1: ent.offset+ent.length]
+                uname = (m.text or "")[ent.offset+1: ent.offset+ent.length]  # без @
                 row = db_query("SELECT user_id, display_name, username FROM users WHERE LOWER(username)=LOWER(?) LIMIT 1;", (uname,))
                 if row:
                     uid, dname, un = row[0]
                     return uid, dname, un
-                return None, None, uname
+                return None, None, uname  # username есть, id не нашли (старые сообщения могли быть без user_id)
+
     return None, None, None
 
 # =========================
@@ -228,15 +268,67 @@ async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.
             return data["choices"][0]["message"]["content"].strip()
 
 # =========================
-# SUMMARY
+# Linkify helpers (для саммари, в психо-аналитике не используем)
+# =========================
+LINK_PAT = re.compile(r"\[link:\s*(https?://[^\]\s]+)\s*\]")
+ANCHOR_PAT = re.compile(r"<a\s+href=['\"](https?://[^'\"]+)['\"]\s*>Источник</a>", re.IGNORECASE)
+
+def _wrap_last_words(text: str, url: str, min_w: int = 2, max_w: int = 5) -> str:
+    # привяжем ссылку к последним 2–5 словам слева
+    parts = re.split(r"(\s+)", text)
+    words = []
+    for i in range(len(parts)-1, -1, -1):
+        if len("".join(words)) >= 60 or len(words) >= (max_w*2-1):
+            break
+        words.insert(0, parts[i])
+    left = "".join(parts[:max(0, len(parts)-len(words))])
+    right = "".join(words)
+    tokens = re.split(r"(\s+)", right)
+    wonly = [t for t in tokens if not t.isspace()]
+    if len(wonly) < min_w:
+        return text
+    k = min(len(wonly), max_w)
+    # склеиваем: берем последние k «словенных» токенов
+    counter = 0
+    left_safe = ""
+    for t in reversed(tokens):
+        left_safe = t + left_safe
+        if not t.isspace():
+            counter += 1
+            if counter >= k:
+                break
+    left_final = left_safe.rstrip()
+    if left != left_safe:
+        left_final += left[len(left_safe):]
+    return left_final + f" <a href='{url}'>" + right[len(left_final):] + "</a>"
+
+def smart_linkify(text: str) -> str:
+    """
+    1) [link: URL] → встроенная ссылка на предыдущие 2–5 слов
+    2) <a href='...'>Источник</a> → тоже превращаем в ссылку на предыдущие 2–5 слов
+    """
+    urls = LINK_PAT.findall(text or "")
+    for url in urls:
+        text = _wrap_last_words(text, url)
+    for m in list(ANCHOR_PAT.finditer(text or "")):
+        url = m.group(1)
+        start, end = m.span()
+        left = text[:start]
+        right = text[end:]
+        tmp = left + f"[link: {url}]" + right
+        text = _wrap_last_words(tmp, url)
+    text = LINK_PAT.sub(lambda mm: f"<a href='{mm.group(1)}'>ссылка</a>", text)
+    return text
+
+# =========================
+# SUMMARY (жёсткий шаблон)
 # =========================
 def prev_summary_link(chat_id: int) -> str | None:
     row = db_query("SELECT message_id FROM last_summary WHERE chat_id=? ORDER BY created_at DESC LIMIT 1;", (chat_id,))
-    if not row:
-        return None
+    if not row: return None
     return tg_link(chat_id, row[0][0])
 
-@core_router.message(Command("lord_summary"))
+@dp.message(Command("lord_summary"))
 async def cmd_summary(m: Message, command: CommandObject):
     try:
         n = int((command.args or "").strip())
@@ -255,6 +347,7 @@ async def cmd_summary(m: Message, command: CommandObject):
     prev_link = prev_summary_link(m.chat.id)
     prev_line_html = f'<a href="{prev_link}">Предыдущий анализ</a>' if prev_link else "Предыдущий анализ (—)"
 
+    # Собираем участников и превращаем в кликабельные имена
     user_ids = tuple({r[0] for r in rows})
     users_map = {}
     if user_ids:
@@ -282,91 +375,265 @@ async def cmd_summary(m: Message, command: CommandObject):
 
     system = (
         "Ты оформляешь краткий отчёт по групповому чату. "
-        "Стиль — нейтральный, информативный. HTML разрешён, структура жёсткая."
+        "Стиль — нейтральный, информативный, без сарказма, метафор и личных оценок. "
+        "Пиши ясно, лаконично, как аналитический отчёт. "
+        "Используй HTML для форматирования, не меняй структуру. "
+        "Каждая тема должна иметь осмысленное название (2–5 слов) и ссылку на начало её обсуждения. "
+        "Не вставляй эмодзи в текст, кроме заданных шаблоном."
     )
     user = (
-        f"Участники: {participants_html}\n\n{dialog_block}\n\n"
-        "Дай отчёт по шаблону из трёх тем со ссылками на 2–5 слов, без слова «Источник»."
+        f"Участники (используй эти кликабельные имена в тексте тем, не используй @): {participants_html}\n\n"
+        f"{dialog_block}\n\n"
+        "Сформируй ответ СТРОГО по этому каркасу (ровно в таком порядке):\n\n"
+        f"{prev_line_html}\n\n"
+        "✂️<b>Краткое содержание</b>:\n"
+        "Два-три коротких предложения, обобщающих разговор. БЕЗ ссылок.\n\n"
+        "😄 <b><a href=\"[link: ТЕМА1_URL]\">[ПРИДУМАННОЕ НАЗВАНИЕ ТЕМЫ]</a></b>\n"
+        "Один абзац (1–3 предложения). Обязательно назови по именам участников, "
+        "и вставь 1–3 ссылки ВНУТРИ текста на 2–5 слов (используй URL из [link: ...]).\n\n"
+        "😄 <b><a href=\"[link: ТЕМА2_URL]\">[ПРИДУМАННОЕ НАЗВАНИЕ ТЕМЫ]</a></b>\n"
+        "Абзац по тем же правилам.\n\n"
+        "😄 <b><a href=\"[link: ТЕМА3_URL]\">[ПРИДУМАННОЕ НАЗВАНИЕ ТЕМЫ]</a></b>\n"
+        "Абзац по тем же правилам. Если явных тем меньше, кратко заверши третью темой-резюме.\n\n"
+        "Заверши одной короткой фразой в нейтральном тоне."
     )
 
     try:
         reply = await ai_reply(system, user, temperature=0.2)
+        reply = smart_linkify(reply)
     except Exception as e:
         reply = f"Суммаризация временно недоступна: {e}"
 
-    await m.reply(sanitize_html_whitelist(reply))
+    safe = sanitize_html_whitelist(reply)
+    sent = await m.reply(safe)
+    db_execute(
+        "INSERT INTO last_summary(chat_id, message_id, created_at) VALUES (?, ?, ?)"
+        "ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id, created_at=excluded.created_at;",
+        (m.chat.id, sent.message_id, now_ts())
+    )
 
 # =========================
-# Психологический портрет (3 абзаца)
+# Психологический портрет (простой: 3 абзаца, без ссылок и <br>)
 # =========================
-@core_router.message(Command("lord_psych"))
+@dp.message(Command("lord_psych"))
 async def cmd_lord_psych(m: Message, command: CommandObject):
+    """
+    Использование:
+      • Ответь командой на сообщение пользователя:   (reply) /lord_psych
+      • Или укажи @username в команде:               /lord_psych @nikki
+    """
     target_id, display_name, uname = await resolve_target_user(m)
     if not target_id and not uname:
         await m.reply("Кого анализируем? Ответь командой на сообщение пользователя или укажи @username.")
         return
 
-    rows = db_query(
-        "SELECT text FROM messages WHERE chat_id=? AND (user_id=? OR username=?) AND text IS NOT NULL ORDER BY id DESC LIMIT 600;",
-        (m.chat.id, target_id or -1, uname)
-    )
+    rows = get_user_messages(m.chat.id, target_id, uname, limit=600)
     if not rows:
-        await m.reply("Нет сообщений в базе по этому пользователю.")
+        hint = "Нет сообщений в базе по этому пользователю."
+        if uname and not target_id:
+            hint += " Возможно, у этого @username нет сохранённого user_id (старые сообщения)."
+        await m.reply(hint)
         return
 
-    texts = [re.sub(r"\s+", " ", (t or "")).strip() for (t,) in rows]
-    joined = " \n".join(texts)[:8000]
+    texts = [t for (t, mid, ts) in rows]
+    def clean(s): 
+        return re.sub(r"\s+", " ", (s or "")).strip()
+    joined = " \n".join(clean(t) for t in texts[:500])
+    if len(joined) > 8000:
+        joined = joined[:8000]
 
-    dname = (display_name or uname or "участник").strip()
+    dname = display_name or uname or "участник"
     target_html = tg_mention(target_id or 0, dname, uname)
 
+    # === Обновлённые промпты: 3 абзаца, без ссылок, без <br> ===
     system = (
-        "Ты — «Лорд Вербус»: остроумный, язвительный аристократ, но без грубости. "
-        "Дай психологический портрет по переписке. Ровно 3 абзаца. HTML минимум."
+        "Ты — «Лорд Вербус»: остроумный, язвительный аристократ с холодным чувством превосходства. "
+        "Пишешь НЕклинический психологический портрет по переписке человека. "
+        "Не ставь диагнозов и не затрагивай чувствительные темы (религия, здоровье, политика, интим). "
+        "Формат — ровно три абзаца обычного текста (без списков, без заголовков, без <br>). "
+        "Абзацы должны быть разделены пустой строкой. "
+        "Тон — изящная ирония, уверенность и лёгкое превосходство, без прямых оскорблений."
     )
+
     user = (
         f"Цель анализа: {target_html}\n\n"
+        "Ниже корпус сообщений (новые → старые). Используй стиль, лексику, ритм и поведенческие маркеры:\n\n"
         f"{joined}\n\n"
-        "1) Вступление с именем жирным. 2) Портрет: стиль, мотиваторы, слепые зоны. 3) Короткий вердикт."
+        "Сформируй вывод из 3 абзацев:\n"
+        "1) Вступление — назови участника по имени (жирным) и дай короткое вводное описание.\n"
+        "2) Основная часть — психологический портрет: манера речи, мотиваторы, отношение к спору/риску, слепые зоны.\n"
+        "3) Заключение — лаконичный саркастичный вердикт в стиле Лорда.\n"
+        "Не вставляй ссылки и HTML, кроме <b>жирного</b> для имени в первом абзаце."
     )
 
     try:
-        reply = strip_outer_quotes(await ai_reply(system, user, temperature=0.55))
+        reply = await ai_reply(system, user, temperature=0.55)
+        reply = strip_outer_quotes(reply)
+        # ничего не линкуем; оставляем только безопасные теги (допустимы <b>/<i> и т.п.)
+        await m.reply(sanitize_html_whitelist(reply))
     except Exception as e:
-        reply = f"Портрет временно недоступен: {e}"
-
-    await m.reply(sanitize_html_whitelist(reply))
+        await m.reply(f"Портрет временно недоступен: {e}")
 
 # =========================
-# Реплики / вмешательство
+# Small talk / interjections
 # =========================
 EPITHETS = [
+    "умозаключение достойное утреннего сна, но не бодрствующего разума",
     "смелость есть, понимания нет — классика жанра",
+    "где логика падала, там родилась эта идея",
     "аргумент звучит уверенно, как кот под дождём",
     "тут мысль пыталась быть острой, но сломала пятку",
+    "интеллектуальный фейерверк, но без фейерверка",
+    "редкий случай, когда тишина убедительнее ответа",
+    "у этой логики крылья из ваты и амбиции из дыма",
+    "настолько поверхностно, что даже воздух смутился",
+    "решение с ароматом отчаяния и налётом глупости",
+    "глубина анализа сравнима с лужей после дождя",
+    "факт — враг этого мнения, но они стараются ужиться",
     "уверенность уровня «я видел это в мемах»",
+    "звучит умно, если отключить критическое мышление",
+    "в этом рассуждении больше пафоса, чем смысла",
+    "дебют блестящий, финал трагический — в духе провинциальной оперы",
+    "где-то плачет здравый смысл, но аплодисменты громче",
+    "смелое предположение, не выдержавшее первой проверки",
+    "поразительно, как из ничего сделали ещё меньше",
+    "ментальная акробатика без страховки и без таланта",
+    "доказательство строилось на вере и кофеине",
+    "изящно, но неправильно — как кража с поклоном",
+    "впечатляет, сколько слов можно потратить без смысла",
+    "логика этого тезиса взята в аренду у фантазии",
+    "аргумент держится на энтузиазме и самоуверенности",
+    "тут даже здравый смысл бы попросил отпуск",
+    "у этой идеи шанс, если закон гравитации отменят",
+    "сформулировано с пафосом, исполнено с апатией",
+    "по форме красиво, по сути жалко",
+    "смесь уверенности и непонимания — взрывоопасна",
+    "впечатление, что разум на перекуре",
+    "серьёзность заявления не спасает его глупость",
+    "на грани логики, но не с той стороны",
+    "тут мысль так одинока, что ей бы подать объявление",
+    "самоуверенность компенсирует отсутствие фактов",
+    "как красиво сказать глупость — вот это талант",
+    "звучит твёрдо, как желе под солнцем",
+    "даже ошибка обиделась бы на такую форму",
+    "у этой идеи масса, но отрицательная",
+    "план, написанный на салфетке и уровнем выше, чем результат",
+    "интеллектуальный пафос, в поисках смысла",
+    "смелая попытка уговорить здравый смысл уйти в отпуск",
+    "наукообразный способ сказать «я не знаю»",
+    "в этой уверенности есть очарование незнания",
+    "слов много, смысл — турист без визы",
 ]
 
-def maybe_pick_epithet(p: float = 0.2) -> str | None:
+def maybe_pick_epithet(p: float = 0.2, min_gap: int = 60) -> str | None:
     if random.random() > p:
         return None
     return random.choice(EPITHETS)
 
-@core_router.message(F.text)
+REPLY_COUNTER = 0
+def bump_reply_counter():
+    global REPLY_COUNTER
+    REPLY_COUNTER += 1
+
+async def reply_to_mention(m: Message):
+    ctx_rows = db_query(
+        "SELECT username, text FROM messages WHERE chat_id=? AND id<=(SELECT MAX(id) FROM messages WHERE message_id=?) ORDER BY id DESC LIMIT 12;",
+        (m.chat.id, m.message_id)
+    )
+    ctx = "\n".join([f"{('@'+u) if u else 'user'}: {t}" for u, t in reversed(ctx_rows)])
+    epithet = maybe_pick_epithet()
+    add = f"\nМожно вставить одно уместное изящное выражение: «{epithet}»." if epithet else ""
+    system = persona_prompt_natural()
+    user = (
+        "Тебя упомянули в групповом чате. Ответь коротко, 1-2 предложения, по существу и с холодной вежливостью. "
+        "Допускается одна колкость или саркастичная ремарка. Допускается лаконичная нецензурная брань. "
+        + add +
+        f"\n\nНедавний контекст:\n{ctx}\n\nСообщение:\n«{m.text}»"
+    )
+    try:
+        reply = await ai_reply(system, user, temperature=0.66)
+        reply = strip_outer_quotes(reply)
+        await m.reply(sanitize_html_whitelist(reply))
+    finally:
+        bump_reply_counter()
+
+async def reply_to_thread(m: Message):
+    ctx_rows = db_query(
+        "SELECT username, text FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 12;",
+        (m.chat.id,)
+    )
+    ctx_block = "\n".join([f"{('@'+u) if u else 'user'}: {t}" for u, t in reversed(ctx_rows)])
+    epithet = maybe_pick_epithet()
+    add = f"\nМожно вставить одно уместное изящное выражение: «{epithet}»." if epithet else ""
+    system = persona_prompt_natural()
+    user = (
+        "Ответь на сообщение в ветке: коротко, высокомерно-иронично, но без прямых оскорблений. "
+        "Сарказм допустим, только не скатывайся в грубость."
+        + add +
+        f"\n\nНедавний контекст:\n{ctx_block}\n\nСообщение:\n«{m.text}»"
+    )
+    reply = await ai_reply(system, user, temperature=0.66)
+    reply = strip_outer_quotes(reply)
+    await m.reply(sanitize_html_whitelist(reply))
+
+async def maybe_interject(m: Message):
+    # вмешиваемся иногда, если явный вопрос и не «тихий час»
+    local_dt = datetime.now()
+    if is_quiet_hours(local_dt): return
+    if not is_question(m.text or ""): return
+    if random.random() > 0.33: return
+    if not can_interject(m.chat.id, cooldown=3600):  # 1800 секунд = 30 мин
+        return
+        
+    ctx_rows = db_query(
+        "SELECT username, text FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 8;",
+        (m.chat.id,)
+    )
+    ctx_block = "\n".join([f"{('@'+u) if u else 'user'}: {t}" for u, t in reversed(ctx_rows)])
+    epithet = maybe_pick_epithet()
+    add = f"\nМожно вставить одно уместное изящное выражение: «{епithet}»." if epithet else ""
+    system = persona_prompt_natural()
+    user = (
+        "Тебя упомянули в групповом чате. Ответь естественно и по делу, кратко; можно добавить одну короткую колкость."
+        + add +
+        f"\n\nНедавний контекст:\n{ctx_block}\n\nСообщение:\n«{m.text}»"
+    )
+    try:
+        reply = await ai_reply(system, user, temperature=0.66)
+        reply = strip_outer_quotes(reply)
+        await m.reply(sanitize_html_whitelist(reply))
+    finally:
+        bump_reply_counter()
+
+# =========================
+# Handlers
+# =========================
+@dp.message(CommandStart())
+async def start(m: Message):
+    await m.reply(
+        "Я — Лорд Вербус. Команды:\n"
+        "• /lord_summary — краткий отчёт по беседе\n"
+        "• /lord_psych — психологический портрет участника (ответь на его сообщение или укажи @username)\n"
+        "Просто говорите — я вмешаюсь, если нужно."
+    )
+
+@dp.message(F.text)
 async def on_text(m: Message):
-    # команды игнорируем здесь (пусть их обрабатывают профильные хендлеры/роутеры)
-    if m.text and m.text.startswith("/"):
+    if not m.text:
         return
 
-    # логируем
-    if m.text:
+    # логируем текст
+    if not m.text.startswith("/"):
         db_execute(
             "INSERT INTO messages(chat_id, user_id, username, text, created_at, message_id) VALUES (?, ?, ?, ?, ?, ?);",
             (m.chat.id, m.from_user.id if m.from_user else 0,
              m.from_user.username if m.from_user else None,
              m.text, now_ts(), m.message_id)
         )
-        # обновим карточку пользователя
+        # --- ХУК АЧИВОК (добавлено) ---
+        await ach_on_text_hook(m)
+
+        # — обновляем карточку пользователя (для кликабельных имён в саммари)
         if m.from_user:
             full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
             db_execute(
@@ -375,94 +642,92 @@ async def on_text(m: Message):
                 (m.from_user.id, full_name, m.from_user.username)
             )
 
-        # Хук ачивок — СЮДА, после логирования
-        await ach_on_text_hook(m)
-
-    # лёгкая авто-реплика по ключевым условиям (необязательно)
     me = await bot.get_me()
-    if mentions_bot(m.text or "", me.username):
-        epithet = maybe_pick_epithet()
-        add = f" «{epithet}»" if epithet else ""
-        await m.reply(sanitize_html_whitelist(f"Слышал. {add}"))
 
-# =========================
-# Уведомление о кружочках
-# =========================
-@core_router.message(F.video_note)
+    if m.text.startswith("/"):
+        return
+
+    if m.reply_to_message and m.reply_to_message.from_user and m.reply_to_message.from_user.id == me.id:
+        await reply_to_thread(m)
+        return
+
+    if mentions_bot(m.text or "", me.username):
+        await reply_to_mention(m)
+        return
+
+    await maybe_interject(m)
+
+# Уведомление о кружочке Даши
+def _message_link(chat, message_id: int) -> str | None:
+    """
+    Возвращает кликабельную ссылку на сообщение, если возможно.
+    Работает для публичных супергрупп/каналов (username) и приватных супергрупп (-100... -> /c/).
+    Для обычных приватных групп без username ссылка недоступна.
+    """
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}/{message_id}"
+    cid = str(chat.id)
+    if cid.startswith("-100"):  # приватная супергруппа
+        return f"https://t.me/c/{cid[4:]}/{message_id}"
+    return None
+
+@dp.message(F.video_note)
 async def on_video_note_watch(m: Message):
+    """
+    Если @daria_mango (WATCH_USER_ID) отправляет видеокружок,
+    бот:
+      1) В ГРУППЕ/СУПЕРГРУППЕ тегает @misukhanov в ответе на это сообщение.
+      2) Дублирует персональное уведомление в ЛС @misukhanov (на случай, если он оффлайн).
+    """
     user = m.from_user
     if not user or user.id != WATCH_USER_ID:
         return
+
+    # кто отправил
     who_html = tg_mention(user.id, user.full_name or user.first_name, user.username)
-    link_html = ""
-    if getattr(m.chat, "username", None):
-        link_html = f" <a href='https://t.me/{m.chat.username}/{m.message_id}'>ссылка</a>"
-    else:
-        cid = str(m.chat.id)
-        if cid.startswith("-100"):
-            link_html = f" <a href='https://t.me/c/{cid[4:]}/{m.message_id}'>ссылка</a>"
+    # кого упомянуть
     notify_html = tg_mention(NOTIFY_USER_ID, f"@{NOTIFY_USERNAME}", NOTIFY_USERNAME)
+
+    link = _message_link(m.chat, m.message_id)
+    link_html = f" <a href=\"{link}\">ссылка</a>" if link else ""
+
+    # 1) Упоминание в самом чате (только для групп/супергрупп)
     if m.chat.type in ("group", "supergroup"):
         try:
-            await m.reply(f"{notify_html}, {who_html} отправил видеокружок.{link_html}", disable_web_page_preview=True)
+            await m.reply(
+                f"{notify_html}, {who_html} отправил видеокружок.{link_html}",
+                disable_web_page_preview=True
+            )
         except Exception:
+            # fallback — без HTML на всякий случай
             await m.reply(f"@{NOTIFY_USERNAME}, видеокружок от @{user.username or user.id}")
 
 # =========================
-# Команды списка в меню
+# Commands list
 # =========================
 async def set_commands():
     commands_group = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
-        BotCommand(command="lord_psych",  description="Психологический портрет"),
-        BotCommand(command="my_achievements", description="Мои ачивки"),
-        BotCommand(command="ach_top", description="Топ по ачивкам"),
+        BotCommand(command="lord_psych",  description="Психологический портрет участника"),
     ]
     commands_private = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
-        BotCommand(command="lord_psych",  description="Психологический портрет"),
-        BotCommand(command="my_achievements", description="Мои ачивки"),
-        BotCommand(command="ach_top", description="Топ по ачивкам"),
+        BotCommand(command="lord_psych",  description="Психологический портрет участника"),
         BotCommand(command="start", description="Приветствие"),
     ]
     await bot.set_my_commands(commands_group, scope=BotCommandScopeAllGroupChats())
     await bot.set_my_commands(commands_private, scope=BotCommandScopeAllPrivateChats())
 
 # =========================
-# Диагностика: неизвестные команды (последним!)
+# Main
 # =========================
-@core_router.message(F.text.startswith("/"))
-async def unknown_command_echo(m: Message):
-    # Этот хендлер сработает ТОЛЬКО если никакой другой командный хендлер не забрал апдейт.
-    log.info("Unknown command reached core_router: %s", m.text)
-    # Не палим админские команды. Просто молча игнорим.
-    # Если хотите видеть явный ответ — раскомментируйте:
-    # await m.reply("Команда не распознана.")
-
-# =========================
-# Start / Main
-# =========================
-@core_router.message(CommandStart())
-async def start(m: Message):
-    await m.reply(
-        "Я — Лорд Вербус. Команды:\n"
-        "• /lord_summary — краткий отчёт по беседе\n"
-        "• /lord_psych — психологический портрет\n"
-        "• /my_achievements — ваши ачивки\n"
-        "• /ach_top — топ по ачивкам\n"
-        "Говорите — вмешаюсь, если будет смысл."
-    )
-
 async def main():
-    log.info("Starting bot…")
+    # Инициализация БД с поддержкой ачивок (ВАЖНО: не трогаем вашу init_db())
     init_db_with_achievements()
-    # ПОРЯДОК ВАЖЕН: сначала ачивки, потом основной роутер
+    # Регистрируем роутер ачивок (команды /ach_* и пользовательские)
     dp.include_router(ach_router)
-    dp.include_router(core_router)
     await set_commands()
-    me = await bot.get_me()
-    log.info("Bot started as @%s", me.username)
-    await dp.start_polling(bot, allowed_updates=["message"])
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
