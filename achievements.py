@@ -14,12 +14,7 @@ from aiogram.types import Message
 # Конфиг
 # =========
 DB = os.getenv("DB_PATH", "bot.sqlite3")
-
-# Список админов (user_id через запятую в переменной окружения ADMIN_IDS),
-# напр. ADMIN_IDS="254160871,123456789"
-ADMIN_IDS = {
-    int(x) for x in os.getenv("ADMIN_IDS", "254160871").replace(" ", "").split(",") if x
-}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "254160871").replace(" ", "").split(",") if x}
 
 router = Router(name="achievements")
 
@@ -27,10 +22,6 @@ router = Router(name="achievements")
 # DB utils
 # =========
 def _conn():
-    # Можно включить именованные строки при желании:
-    # c = sqlite3.connect(DB)
-    # c.row_factory = sqlite3.Row
-    # return c
     return sqlite3.connect(DB)
 
 def _exec(sql: str, params: tuple = ()):
@@ -47,52 +38,26 @@ def _now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
 # =========
-# Init schema + миграция
+# Init schema + миграции (все таблицы)
 # =========
-def _table_has_column(table: str, col: str) -> bool:
+def _table_exists(name: str) -> bool:
     with closing(_conn()) as c:
-        cur = c.execute(f"PRAGMA table_info({table});")
-        cols = [r[1] for r in cur.fetchall()]  # name = index 1
-        return col in cols
-
-def _table_exists(table: str) -> bool:
-    with closing(_conn()) as c:
-        cur = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table,))
+        cur = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (name,))
         return cur.fetchone() is not None
 
-def _migrate_achievements_schema():
-    # Если таблицы нет — просто выходим, её создаст init_db ниже
-    if not _table_exists("achievements"):
-        return
-
-    # Определим фактические колонки
+def _table_cols(name: str) -> list[str]:
+    if not _table_exists(name):
+        return []
     with closing(_conn()) as c:
-        existing_cols = [r[1] for r in c.execute("PRAGMA table_info(achievements);").fetchall()]
-    def has(col: str) -> bool:
-        return col in existing_cols
+        cur = c.execute(f"PRAGMA table_info({name});")
+        return [r[1] for r in cur.fetchall()]  # name = index 1
 
-    need_rebuild = False
-    add_columns: list[str] = []
-
-    # Критично: первичный ключ id. Если его нет — пересборка.
-    if not has("id"):
-        need_rebuild = True
-
-    # Эти можно добавить ALTER'ом при необходимости
-    if not has("condition_type"):
-        add_columns.append("ALTER TABLE achievements ADD COLUMN condition_type TEXT")
-    if not has("thresholds"):
-        add_columns.append("ALTER TABLE achievements ADD COLUMN thresholds TEXT")
-    if not has("target_ts"):
-        add_columns.append("ALTER TABLE achievements ADD COLUMN target_ts INTEGER")
-    if not has("active"):
-        add_columns.append("ALTER TABLE achievements ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-    if not has("extra_json"):
-        add_columns.append("ALTER TABLE achievements ADD COLUMN extra_json TEXT")
-
+def _rebuild_achievements_if_needed():
+    cols = _table_cols("achievements")
+    need_rebuild = ("id" not in cols)
     with closing(_conn()) as c:
         if need_rebuild:
-            # Пересоберём таблицу через new->copy->drop->rename
+            # создаём новую таблицу со всеми нужными полями
             c.execute("""
                 CREATE TABLE IF NOT EXISTS achievements_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,52 +72,116 @@ def _migrate_achievements_schema():
                     extra_json TEXT
                 );
             """)
-
-            # Соберём SELECT под любую старую схему
-            sel_id          = "id" if has("id") else "rowid"
-            sel_code        = "code" if has("code") else "NULL"
-            sel_title       = "title" if has("title") else "''"
-            sel_description = "description" if has("description") else "''"
-            sel_kind        = "kind" if has("kind") else "'single'"
-            sel_cond        = "condition_type" if has("condition_type") else "'messages'"
-            sel_thresholds  = "thresholds" if has("thresholds") else "NULL"
-            sel_target_ts   = "target_ts" if has("target_ts") else "NULL"
-            sel_active      = "active" if has("active") else "1"
-            sel_extra       = "extra_json" if has("extra_json") else "NULL"
-
-            # Переносим данные
-            c.execute(f"""
-                INSERT OR IGNORE INTO achievements_new
-                (id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json)
-                SELECT
-                    {sel_id} AS id,
-                    {sel_code},
-                    {sel_title},
-                    {sel_description},
-                    {sel_kind},
-                    {sel_cond},
-                    {sel_thresholds},
-                    {sel_target_ts},
-                    {sel_active},
-                    {sel_extra}
-                FROM achievements;
-            """)
-            c.execute("DROP TABLE achievements;")
+            # безопасный SELECT из старой
+            sel = {
+                "id":       "id" if "id" in cols else "rowid",
+                "code":     "code" if "code" in cols else "NULL",
+                "title":    "title" if "title" in cols else "''",
+                "desc":     "description" if "description" in cols else "''",
+                "kind":     "kind" if "kind" in cols else "'single'",
+                "ctype":    "condition_type" if "condition_type" in cols else "'messages'",
+                "thr":      "thresholds" if "thresholds" in cols else "NULL",
+                "ts":       "target_ts" if "target_ts" in cols else "NULL",
+                "active":   "active" if "active" in cols else "1",
+                "extra":    "extra_json" if "extra_json" in cols else "NULL",
+            }
+            if cols:
+                c.execute(f"""
+                    INSERT OR IGNORE INTO achievements_new
+                    (id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json)
+                    SELECT {sel['id']}, {sel['code']}, {sel['title']}, {sel['desc']},
+                           {sel['kind']}, {sel['ctype']}, {sel['thr']}, {sel['ts']}, {sel['active']}, {sel['extra']}
+                    FROM achievements;
+                """)
+                c.execute("DROP TABLE achievements;")
             c.execute("ALTER TABLE achievements_new RENAME TO achievements;")
             c.commit()
         else:
-            for ddl in add_columns:
+            # дозаводим недостающие поля через ALTER
+            need = {
+                "condition_type": "ALTER TABLE achievements ADD COLUMN condition_type TEXT",
+                "thresholds":     "ALTER TABLE achievements ADD COLUMN thresholds TEXT",
+                "target_ts":      "ALTER TABLE achievements ADD COLUMN target_ts INTEGER",
+                "active":         "ALTER TABLE achievements ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+                "extra_json":     "ALTER TABLE achievements ADD COLUMN extra_json TEXT",
+            }
+            for col, ddl in need.items():
+                if col not in cols:
+                    try: c.execute(ddl + ";")
+                    except sqlite3.OperationalError: pass
+            c.commit()
+
+def _rebuild_user_stats_if_needed():
+    cols = _table_cols("user_stats")
+    # нужная схема: chat_id, user_id, messages_count
+    need_rebuild = not cols or any(c not in cols for c in ("chat_id","user_id","messages_count"))
+    with closing(_conn()) as c:
+        if need_rebuild:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS user_stats_new (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    messages_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(chat_id, user_id)
+                );
+            """)
+            if cols:
+                # попробуем скопировать, если есть пересекающиеся поля
+                sel_chat = "chat_id" if "chat_id" in cols else "0"
+                sel_user = "user_id" if "user_id" in cols else "user_id" if "id" not in cols else "0"
+                sel_cnt  = "messages_count" if "messages_count" in cols else "0"
                 try:
-                    c.execute(ddl + ";")
+                    c.execute(f"""
+                        INSERT OR IGNORE INTO user_stats_new (chat_id, user_id, messages_count)
+                        SELECT {sel_chat}, {sel_user}, {sel_cnt} FROM user_stats;
+                    """)
                 except sqlite3.OperationalError:
                     pass
+                c.execute("DROP TABLE user_stats;")
+            c.execute("ALTER TABLE user_stats_new RENAME TO user_stats;")
+            c.commit()
+
+def _rebuild_user_achievements_if_needed():
+    cols = _table_cols("user_achievements")
+    # нужная схема: chat_id, user_id, achievement_id, tier, unlocked_at
+    need_rebuild = not cols or any(c not in cols for c in ("chat_id","user_id","achievement_id","tier","unlocked_at"))
+    with closing(_conn()) as c:
+        if need_rebuild:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS user_achievements_new (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    achievement_id INTEGER NOT NULL,
+                    tier INTEGER NOT NULL DEFAULT 1,
+                    unlocked_at INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, user_id, achievement_id, tier),
+                    FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
+                );
+            """)
+            if cols:
+                sel_chat = "chat_id" if "chat_id" in cols else "0"
+                sel_user = "user_id" if "user_id" in cols else "user_id" if "id" not in cols else "0"
+                sel_ach  = "achievement_id" if "achievement_id" in cols else "achievement_id" if "ach_id" in cols else "0"
+                sel_tier = "tier" if "tier" in cols else "1"
+                sel_time = "unlocked_at" if "unlocked_at" in cols else "strftime('%s','now')"
+                try:
+                    c.execute(f"""
+                        INSERT OR IGNORE INTO user_achievements_new
+                        (chat_id, user_id, achievement_id, tier, unlocked_at)
+                        SELECT {sel_chat}, {sel_user}, {sel_ach}, {sel_tier}, {sel_time}
+                        FROM user_achievements;
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                c.execute("DROP TABLE user_achievements;")
+            c.execute("ALTER TABLE user_achievements_new RENAME TO user_achievements;")
             c.commit()
 
 def init_db():
+    # базовое создание (если первый запуск)
     with closing(_conn()) as c:
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
-        # Создаём, если нет
         c.execute("""
         CREATE TABLE IF NOT EXISTS achievements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,9 +216,10 @@ def init_db():
         );
         """)
         c.commit()
-
-    # После создания/проверок — миграция для старых БД
-    _migrate_achievements_schema()
+    # миграции для любых старых схем
+    _rebuild_achievements_if_needed()
+    _rebuild_user_stats_if_needed()
+    _rebuild_user_achievements_if_needed()
 
 # =========
 # Helpers
@@ -198,7 +228,6 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 def _parse_thresholds(s: str) -> list[int]:
-    # "100, 1000, 10000" -> [100,1000,10000]
     vals = []
     for p in (s or "").split(","):
         p = p.strip()
@@ -214,20 +243,16 @@ def _parse_thresholds(s: str) -> list[int]:
     return vals
 
 def _pretty_box(text: str) -> str:
-    # Лёгкая «рамка» — совместима с Telegram HTML parse_mode
     line = "━━━━━━━━━━━━━━━━━━━━━━━━"
     return f"<b>{line}</b>\n{text}\n<b>{line}</b>"
 
 def _calc_rarity(chat_id: int, achievement_id: int) -> float:
-    # считем по вашей таблице messages
     total = _q("SELECT COUNT(DISTINCT user_id) FROM messages WHERE chat_id=?;", (chat_id,))[0][0] or 0
     have  = _q("SELECT COUNT(DISTINCT user_id) FROM user_achievements WHERE chat_id=? AND achievement_id=?;", (chat_id, achievement_id))[0][0] or 0
     if total == 0:
         return 0.0
-    # редкость = 100 - доля получивших
     got_share = have / total
-    rarity = max(0.0, 100.0 - got_share * 100.0)
-    return round(rarity, 2)
+    return round(max(0.0, 100.0 - got_share * 100.0), 2)
 
 async def _announce(m: Message, title: str, description: str, rarity: float, tier_label: str | None = None):
     tier_suffix = f"\n<i>Уровень:</i> <b>{tier_label}</b>" if tier_label else ""
@@ -240,100 +265,6 @@ async def _announce(m: Message, title: str, description: str, rarity: float, tie
     )
     await m.answer(_pretty_box(text), disable_web_page_preview=True)
 
-# =========
-# Публичные хуки
-# =========
-async def on_text_hook(m: Message):
-    """
-    Вызывайте из вашего on_text сразу после логирования сообщения.
-    Инкремент счётчиков и проверка триггеров.
-    """
-    if not m.from_user:
-        return
-    chat_id = m.chat.id
-    user_id = m.from_user.id
-
-    # 1) счётчик сообщений
-    _exec("INSERT OR IGNORE INTO user_stats(chat_id, user_id) VALUES(?, ?);", (chat_id, user_id))
-    _exec("UPDATE user_stats SET messages_count=messages_count+1 WHERE chat_id=? AND user_id=?;", (chat_id, user_id))
-
-    # 2) активные ачивки
-    achs = _q("""
-        SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
-        FROM achievements
-        WHERE active=1;
-    """)
-    if not achs:
-        return
-
-    msg_cnt = _q("SELECT messages_count FROM user_stats WHERE chat_id=? AND user_id=?;", (chat_id, user_id))[0][0]
-    text = (m.text or m.caption or "")
-
-    for (aid, code, title, desc, kind, ctype, thresholds_json, target_ts, active, extra_json) in achs:
-        # thresholds
-        thresholds: list[int] = []
-        if thresholds_json:
-            try:
-                thresholds = sorted(set(map(int, json.loads(thresholds_json))))
-            except Exception:
-                thresholds = []
-
-        # messages
-        if ctype == "messages":
-            if kind == "single":
-                limit = thresholds[0] if thresholds else None
-                if limit and msg_cnt >= limit and not _user_has_tier(chat_id, user_id, aid, 1):
-                    _unlock(chat_id, user_id, aid, 1)
-                    await _announce(m, title, desc, _calc_rarity(chat_id, aid))
-            else:
-                for idx, limit in enumerate(thresholds, start=1):
-                    if msg_cnt >= limit and not _user_has_tier(chat_id, user_id, aid, idx):
-                        _unlock(chat_id, user_id, aid, idx)
-                        await _announce(m, title, desc, _calc_rarity(chat_id, aid), tier_label=f"{idx}/{len(thresholds)}")
-
-        # date
-        elif ctype == "date" and target_ts:
-            if _now_ts() >= int(target_ts) and not _user_has_tier(chat_id, user_id, aid, 1):
-                _unlock(chat_id, user_id, aid, 1)
-                await _announce(m, title, desc, _calc_rarity(chat_id, aid))
-
-        # keyword
-        elif ctype == "keyword":
-            kw = None
-            try:
-                kw = json.loads(extra_json).get("keyword") if extra_json else None
-            except Exception:
-                kw = None
-            if not kw:
-                continue
-
-            contains_now = kw.lower() in (text or "").lower()
-            if not contains_now:
-                continue
-
-            # считаем исторические вхождения по таблице messages
-            try:
-                total = _q("""
-                    SELECT COUNT(*) FROM messages
-                    WHERE chat_id=? AND user_id=? AND LOWER(text) LIKE LOWER(?);
-                """, (chat_id, user_id, f"%{kw}%"))[0][0]
-            except Exception:
-                total = 1  # fallback
-
-            if kind == "single":
-                limit = thresholds[0] if thresholds else None
-                if limit and total >= limit and not _user_has_tier(chat_id, user_id, aid, 1):
-                    _unlock(chat_id, user_id, aid, 1)
-                    await _announce(m, title, desc, _calc_rarity(chat_id, aid))
-            else:
-                for idx, limit in enumerate(thresholds, start=1):
-                    if total >= limit and not _user_has_tier(chat_id, user_id, aid, idx):
-                        _unlock(chat_id, user_id, aid, idx)
-                        await _announce(m, title, desc, _calc_rarity(chat_id, aid), tier_label=f"{idx}/{len(thresholds)}")
-
-# =========
-# Низкоуровневые операции
-# =========
 def _user_has_tier(chat_id: int, user_id: int, ach_id: int, tier: int) -> bool:
     row = _q(
         "SELECT 1 FROM user_achievements WHERE chat_id=? AND user_id=? AND achievement_id=? AND tier=? LIMIT 1;",
@@ -347,6 +278,87 @@ def _unlock(chat_id: int, user_id: int, ach_id: int, tier: int):
         (chat_id, user_id, ach_id, tier, _now_ts())
     )
 
+# =========
+# Публичный хук (вызывать после логирования сообщения)
+# =========
+async def on_text_hook(m: Message):
+    if not m.from_user:
+        return
+    chat_id = m.chat.id
+    user_id = m.from_user.id
+
+    # учёт сообщений
+    _exec("INSERT OR IGNORE INTO user_stats(chat_id, user_id) VALUES(?, ?);", (chat_id, user_id))
+    _exec("UPDATE user_stats SET messages_count=messages_count+1 WHERE chat_id=? AND user_id=?;", (chat_id, user_id))
+
+    # активные ачивки
+    achs = _q("""
+        SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
+        FROM achievements
+        WHERE active=1;
+    """)
+    if not achs:
+        return
+
+    msg_cnt = _q("SELECT messages_count FROM user_stats WHERE chat_id=? AND user_id=?;", (chat_id, user_id))[0][0]
+    text = (m.text or m.caption or "")
+
+    for aid, code, title, desc, kind, ctype, thr_json, target_ts, active, extra_json in achs:
+        # thresholds
+        try:
+            thresholds = sorted(set(map(int, json.loads(thr_json)))) if thr_json else []
+        except Exception:
+            thresholds = []
+
+        if ctype == "messages":
+            if kind == "single":
+                limit = thresholds[0] if thresholds else None
+                if limit and msg_cnt >= limit and not _user_has_tier(chat_id, user_id, aid, 1):
+                    _unlock(chat_id, user_id, aid, 1)
+                    await _announce(m, title, desc, _calc_rarity(chat_id, aid))
+            else:
+                for idx, limit in enumerate(thresholds, start=1):
+                    if msg_cnt >= limit and not _user_has_tier(chat_id, user_id, aid, idx):
+                        _unlock(chat_id, user_id, aid, idx)
+                        await _announce(m, title, desc, _calc_rarity(chat_id, aid), tier_label=f"{idx}/{len(thresholds)}")
+
+        elif ctype == "date" and target_ts:
+            if _now_ts() >= int(target_ts) and not _user_has_tier(chat_id, user_id, aid, 1):
+                _unlock(chat_id, user_id, aid, 1)
+                await _announce(m, title, desc, _calc_rarity(chat_id, aid))
+
+        elif ctype == "keyword":
+            kw = None
+            try:
+                kw = json.loads(extra_json).get("keyword") if extra_json else None
+            except Exception:
+                kw = None
+            if not kw:
+                continue
+            if kw.lower() not in (text or "").lower():
+                continue
+            # считаем исторические вхождения
+            try:
+                total = _q("""
+                    SELECT COUNT(*) FROM messages
+                    WHERE chat_id=? AND user_id=? AND LOWER(text) LIKE LOWER(?);
+                """, (chat_id, user_id, f"%{kw}%"))[0][0]
+            except Exception:
+                total = 1
+            if kind == "single":
+                limit = thresholds[0] if thresholds else None
+                if limit and total >= limit and not _user_has_tier(chat_id, user_id, aid, 1):
+                    _unlock(chat_id, user_id, aid, 1)
+                    await _announce(m, title, desc, _calc_rarity(chat_id, aid))
+            else:
+                for idx, limit in enumerate(thresholds, start=1):
+                    if total >= limit and not _user_has_tier(chat_id, user_id, aid, idx):
+                        _unlock(chat_id, user_id, aid, idx)
+                        await _announce(m, title, desc, _calc_rarity(chat_id, aid), tier_label=f"{idx}/{len(thresholds)}")
+
+# =========
+# Поиск ачивки
+# =========
 def _find_achievement_by_code_or_id(code_or_id: str) -> tuple | None:
     sql = """
         SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
@@ -366,19 +378,13 @@ def _find_achievement_by_code_or_id(code_or_id: str) -> tuple | None:
 @router.message(Command("ach_add"))
 async def cmd_ach_add(m: Message, command: CommandObject):
     """
-    Форматы:
-    1) messages + tiered:
-       /ach_add code|Заголовок|Описание|tiered|messages|100,1000,10000
-    2) messages + single:
-       /ach_add code|Заголовок|Описание|single|messages|100
-    3) date + single:
-       /ach_add code|Заголовок|Описание|single|date|2025-12-31
-    4) keyword + tiered:
-       /ach_add code|Заголовок|Описание|tiered|keyword:WORD|1,3,5
+    1) /ach_add code|title|description|tiered|messages|100,1000,10000
+    2) /ach_add code|title|description|single|messages|100
+    3) /ach_add code|title|description|single|date|YYYY-MM-DD
+    4) /ach_add code|title|description|tiered|keyword:WORD|1,3,5
     """
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
-
     args = (command.args or "").split("|")
     if len(args) != 6:
         return await m.reply(
@@ -388,11 +394,9 @@ async def cmd_ach_add(m: Message, command: CommandObject):
             "3) /ach_add code|title|description|single|date|YYYY-MM-DD\n"
             "4) /ach_add code|title|description|tiered|keyword:WORD|1,3,5"
         )
-
     code, title, desc, kind, cond, data = [a.strip() for a in args]
     if kind not in ("single", "tiered"):
         return await m.reply("kind: single|tiered")
-
     cond_type = cond
     keyword = None
     if cond.startswith("keyword:"):
@@ -400,14 +404,12 @@ async def cmd_ach_add(m: Message, command: CommandObject):
         keyword = cond.split(":", 1)[1].strip()
         if not keyword:
             return await m.reply("Укажите слово после keyword:, напр. keyword:testtest")
-
     if cond_type not in ("messages", "date", "keyword"):
         return await m.reply("condition: messages | date | keyword:<word>")
 
     thresholds_json = None
     target_ts = None
     extra_json = None
-
     try:
         if cond_type == "messages":
             thresholds = _parse_thresholds(data)
@@ -463,7 +465,7 @@ async def cmd_ach_list(m: Message):
     if not rows:
         return await m.reply("Список пуст.")
     parts = []
-    for (rid, code, title, kind, ctype, thr, ts, active, extra_json) in rows:
+    for rid, code, title, kind, ctype, thr, ts, active, extra_json in rows:
         data = []
         if ctype == "messages":
             data.append(f"thresholds={thr}")
@@ -480,10 +482,6 @@ async def cmd_ach_list(m: Message):
 
 @router.message(Command("ach_edit"))
 async def cmd_ach_edit(m: Message, command: CommandObject):
-    """
-    /ach_edit code|field|value
-    поля: title, description, thresholds, target_date(YYYY-MM-DD), kind(single|tiered), active(0/1)
-    """
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
     args = (command.args or "").split("|")
@@ -493,7 +491,6 @@ async def cmd_ach_edit(m: Message, command: CommandObject):
     ach = _find_achievement_by_code_or_id(code_or_id)
     if not ach:
         return await m.reply("Ачивка не найдена.")
-
     rid = ach[0]
     try:
         if field == "title":
@@ -521,22 +518,15 @@ async def cmd_ach_edit(m: Message, command: CommandObject):
 
 @router.message(Command("ach_progress"))
 async def cmd_ach_progress(m: Message, command: CommandObject):
-    """
-    /ach_progress code
-    Показывает прогресс всех пользователей по указанной ачивке.
-    Для messages: текущий счётчик и ближайший порог.
-    """
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
     code = (command.args or "").strip()
     if not code:
         return await m.reply("Укажите code или id ачивки.")
-
     ach = _find_achievement_by_code_or_id(code)
     if not ach:
         return await m.reply("Ачивка не найдена.")
-
-    (aid, _, title, _, kind, ctype, thr_json, target_ts, active, extra_json) = ach
+    aid, _, title, _, kind, ctype, thr_json, target_ts, active, extra_json = ach
     try:
         thresholds = sorted(set(map(int, json.loads(thr_json)))) if thr_json else []
     except Exception:
@@ -564,10 +554,7 @@ async def cmd_ach_progress(m: Message, command: CommandObject):
                 if msg_cnt < t:
                     next_thr = t
                     break
-            if next_thr is None and thresholds:
-                status = f"все уровни ({taken}/{len(thresholds)})"
-            else:
-                status = f"{msg_cnt} / {next_thr or '-'}"
+            status = f"все уровни ({taken}/{len(thresholds)})" if next_thr is None and thresholds else f"{msg_cnt} / {next_thr or '-'}"
             lines.append(f"• user_id={uid}: {status}")
     elif ctype == "keyword":
         try:
@@ -581,9 +568,6 @@ async def cmd_ach_progress(m: Message, command: CommandObject):
 
 @router.message(Command("ach_reset"))
 async def cmd_ach_reset(m: Message, command: CommandObject):
-    """
-    /ach_reset code @user (или user_id)
-    """
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
     args = (command.args or "").split()
@@ -593,7 +577,6 @@ async def cmd_ach_reset(m: Message, command: CommandObject):
     ach = _find_achievement_by_code_or_id(code)
     if not ach:
         return await m.reply("Ачивка не найдена.")
-
     u = args[1].strip()
     if u.startswith("@"):
         row = _q("SELECT user_id FROM users WHERE LOWER(username)=LOWER(?) LIMIT 1;", (u[1:],))
@@ -605,8 +588,7 @@ async def cmd_ach_reset(m: Message, command: CommandObject):
             user_id = int(u)
         except Exception:
             return await m.reply("Некорректный user.")
-    _exec("DELETE FROM user_achievements WHERE chat_id=? AND user_id=? AND achievement_id=?;",
-          (m.chat.id, user_id, ach[0]))
+    _exec("DELETE FROM user_achievements WHERE chat_id=? AND user_id=? AND achievement_id=?;", (m.chat.id, user_id, ach[0]))
     await m.reply("Сброшено.")
 
 # =========
@@ -618,8 +600,8 @@ async def cmd_my_achievements(m: Message):
         return
     rows = _q("""
         SELECT a.title, a.description, a.kind, a.condition_type, ua.tier, ua.unlocked_at
-        FROM user_achievements ua
-        JOIN achievements a ON a.id=ua.achievement_id
+        FROM user_achievements AS ua
+        JOIN achievements AS a ON a.id = ua.achievement_id
         WHERE ua.chat_id=? AND ua.user_id=?
         ORDER BY ua.unlocked_at DESC;
     """, (m.chat.id, m.from_user.id))
@@ -645,8 +627,6 @@ async def cmd_ach_top(m: Message):
     if not rows:
         return await m.reply("Пока никто не получил ачивок.")
     lines = ["<b>Топ по ачивкам</b>:"]
-    place = 1
-    for uid, cnt in rows:
-        lines.append(f"{place}. user_id={uid} — {cnt}")
-        place += 1
+    for i, (uid, cnt) in enumerate(rows, start=1):
+        lines.append(f"{i}. user_id={uid} — {cnt}")
     await m.reply("\n".join(lines))
