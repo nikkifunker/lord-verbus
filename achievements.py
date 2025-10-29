@@ -45,10 +45,106 @@ def _now_ts() -> int:
 # =========
 # Init schema
 # =========
+def _table_has_column(table: str, col: str) -> bool:
+    with closing(_conn()) as c:
+        cur = c.execute(f"PRAGMA table_info({table});")
+        cols = [r[1] for r in cur.fetchall()]  # name = index 1
+        return col in cols
+
+def _table_exists(table: str) -> bool:
+    with closing(_conn()) as c:
+        cur = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table,))
+        return cur.fetchone() is not None
+
+def _migrate_achievements_schema():
+    # Если таблицы нет — просто выходим, её создаст init_db ниже
+    if not _table_exists("achievements"):
+        return
+
+    need_rebuild = False
+    add_columns: list[tuple[str, str]] = []  # (col, ddl)
+
+    # Проверим ключевые колонки
+    if not _table_has_column("achievements", "id"):
+        need_rebuild = True  # без id — проще пересобрать
+
+    # Эти колонки можно добавить через ALTER, если их нет
+    for col, ddl in [
+        ("condition_type", "ALTER TABLE achievements ADD COLUMN condition_type TEXT"),
+        ("thresholds",     "ALTER TABLE achievements ADD COLUMN thresholds TEXT"),
+        ("target_ts",      "ALTER TABLE achievements ADD COLUMN target_ts INTEGER"),
+        ("active",         "ALTER TABLE achievements ADD COLUMN active INTEGER NOT NULL DEFAULT 1"),
+        ("extra_json",     "ALTER TABLE achievements ADD COLUMN extra_json TEXT"),
+    ]:
+        if not _table_has_column("achievements", col):
+            add_columns.append((col, ddl))
+
+    with closing(_conn()) as c:
+        if need_rebuild:
+            # Пересоберём таблицу через new->copy->drop->rename
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS achievements_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT UNIQUE NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK(kind IN ('single','tiered')),
+                    condition_type TEXT NOT NULL CHECK(condition_type IN ('messages','date','keyword')),
+                    thresholds TEXT,
+                    target_ts INTEGER,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    extra_json TEXT
+                );
+            """)
+            # Скопируем данные из старой таблицы, стараясь подставить дефолты
+            # Попытаемся вытащить существующие поля «мягко»
+            existing_cols = [r[1] for r in c.execute("PRAGMA table_info(achievements);").fetchall()]
+            def has(col): return col in existing_cols
+
+            # Собираем SELECT-часть под любые старые схемы
+            sel_code         = "code" if has("code") else "NULL"
+            sel_title        = "title" if has("title") else "''"
+            sel_description  = "description" if has("description") else "''"
+            sel_kind         = "kind" if has("kind") else "'single'"
+            sel_cond         = "condition_type" if has("condition_type") else "'messages'"
+            sel_thresholds   = "thresholds" if has("thresholds") else "NULL"
+            sel_target_ts    = "target_ts" if has("target_ts") else "NULL"
+            sel_active       = "active" if has("active") else "1"
+            sel_extra        = "extra_json" if has("extra_json") else "NULL"
+
+            c.execute(f"""
+                INSERT OR IGNORE INTO achievements_new
+                (id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json)
+                SELECT
+                    COALESCE(id, rowid) AS id,
+                    {sel_code},
+                    {sel_title},
+                    {sel_description},
+                    {sel_kind},
+                    {sel_cond},
+                    {sel_thresholds},
+                    {sel_target_ts},
+                    {sel_active},
+                    {sel_extra}
+                FROM achievements;
+            """)
+            c.execute("DROP TABLE achievements;")
+            c.execute("ALTER TABLE achievements_new RENAME TO achievements;")
+            c.commit()
+        else:
+            # Достаточно добавить недостающие поля
+            for _, ddl in add_columns:
+                try:
+                    c.execute(ddl + ";")
+                except sqlite3.OperationalError:
+                    pass
+            c.commit()
+
 def init_db():
     with closing(_conn()) as c:
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
+        # Создаём, если нет
         c.execute("""
         CREATE TABLE IF NOT EXISTS achievements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,28 +178,10 @@ def init_db():
             FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
         );
         """)
-        # Миграция для старых БД (если столбца нет)
-        try:
-            c.execute("ALTER TABLE achievements ADD COLUMN extra_json TEXT;")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute("ALTER TABLE achievements ADD COLUMN active INTEGER NOT NULL DEFAULT 1;")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute("ALTER TABLE achievements ADD COLUMN target_ts INTEGER;")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute("ALTER TABLE achievements ADD COLUMN thresholds TEXT;")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute("ALTER TABLE achievements ADD COLUMN condition_type TEXT;")
-        except sqlite3.OperationalError:
-            pass
         c.commit()
+
+    # ВАЖНО: сразу после создания/проверок — прогоняем миграцию
+    _migrate_achievements_schema()
 
 
 # =========
@@ -165,13 +243,13 @@ def _title_desc(ach_row: tuple) -> tuple[str, str]:
 
 def _find_achievement_by_code_or_id(code_or_id: str) -> tuple | None:
     sql = """
-        SELECT id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
+        SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
         FROM achievements
         WHERE {where}
         LIMIT 1;
     """
     if code_or_id.isdigit():
-        rows = _q(sql.format(where="id=?"), (int(code_or_id),))
+        rows = _q(sql.format(where="COALESCE(id,rowid)=?"), (int(code_or_id),))
     else:
         rows = _q(sql.format(where="LOWER(code)=LOWER(?)"), (code_or_id,))
     return rows[0] if rows else None
@@ -214,10 +292,11 @@ async def on_text_hook(m: Message):
     _exec("UPDATE user_stats SET messages_count=messages_count+1 WHERE chat_id=? AND user_id=?;", (chat_id, user_id))
 
     achs = _q("""
-    SELECT id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
+    SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
     FROM achievements
     WHERE active=1;
 """)
+
 
     if not achs:
         return
@@ -389,7 +468,7 @@ async def cmd_ach_list(m: Message):
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
     rows = _q("""
-        SELECT id, code, title, kind, condition_type, thresholds, target_ts, active, extra_json
+        SELECT COALESCE(id,rowid) AS id, code, title, kind, condition_type, thresholds, target_ts, active, extra_json
         FROM achievements
         ORDER BY id;
     """)
