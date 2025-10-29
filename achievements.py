@@ -14,7 +14,7 @@ from aiogram.types import Message
 # Конфиг
 # =========
 DB = os.getenv("DB_PATH", "bot.sqlite3")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "254160871").replace(" ", "").split(",") if x}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "320872593").replace(" ", "").split(",") if x}
 
 router = Router(name="achievements")
 
