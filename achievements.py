@@ -451,7 +451,7 @@ async def cmd_ach_del(m: Message, command: CommandObject):
     _exec("DELETE FROM achievements WHERE id=?;", (ach[0],))
     await m.reply("Удалено.")
 
-@router.message(Command("ach_list")))
+@router.message(Command("ach_list"))
 async def cmd_ach_list(m: Message):
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
@@ -478,7 +478,7 @@ async def cmd_ach_list(m: Message):
         parts.append(f"#{rid} <b>{title}</b> (<code>{code}</code>) — {kind}/{ctype}, {'; '.join(data)}, active={active}")
     await m.reply("\n".join(parts), disable_web_page_preview=True)
 
-@router.message(Command("ach_edit")))
+@router.message(Command("ach_edit"))
 async def cmd_ach_edit(m: Message, command: CommandObject):
     """
     /ach_edit code|field|value
@@ -519,7 +519,7 @@ async def cmd_ach_edit(m: Message, command: CommandObject):
     except Exception as e:
         await m.reply(f"Ошибка: {e}")
 
-@router.message(Command("ach_progress")))
+@router.message(Command("ach_progress"))
 async def cmd_ach_progress(m: Message, command: CommandObject):
     """
     /ach_progress code
@@ -579,7 +579,7 @@ async def cmd_ach_progress(m: Message, command: CommandObject):
         lines.append("Тип: date — выдаётся автоматически после наступления даты при любой активности.")
     await m.reply("\n".join(lines))
 
-@router.message(Command("ach_reset")))
+@router.message(Command("ach_reset"))
 async def cmd_ach_reset(m: Message, command: CommandObject):
     """
     /ach_reset code @user (или user_id)
@@ -612,7 +612,7 @@ async def cmd_ach_reset(m: Message, command: CommandObject):
 # =========
 # Команды: для всех
 # =========
-@router.message(Command("my_achievements")))
+@router.message(Command("my_achievements"))
 async def cmd_my_achievements(m: Message):
     if not m.from_user:
         return
@@ -632,7 +632,7 @@ async def cmd_my_achievements(m: Message):
         parts.append(f"• <b>{title}</b>{level} — {desc}  <i>({when})</i>")
     await m.reply("\n".join(parts), disable_web_page_preview=True)
 
-@router.message(Command("ach_top")))
+@router.message(Command("ach_top"))
 async def cmd_ach_top(m: Message):
     rows = _q("""
         SELECT user_id, COUNT(*) AS cnt
