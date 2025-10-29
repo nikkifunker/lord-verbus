@@ -384,7 +384,7 @@ async def cmd_ach_del(m: Message, command: CommandObject):
     _exec("DELETE FROM achievements WHERE id=?;", (ach[0],))
     await m.reply("Удалено.")
 
-@router.message(Command("ach_list")))
+@router.message(Command("ach_list"))
 async def cmd_ach_list(m: Message):
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
