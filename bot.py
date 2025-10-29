@@ -15,6 +15,8 @@ from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.types import Message, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+
+# === achievements module (РОУТЕР, init и хук) ===
 from achievements import router as ach_router, init_db as ach_init_db, on_text_hook as ach_on_text_hook
 
 
@@ -506,7 +508,6 @@ EPITHETS = [
     "тут даже здравый смысл бы попросил отпуск",
     "у этой идеи шанс, если закон гравитации отменят",
     "сформулировано с пафосом, исполнено с апатией",
-    "по форме красиво, по сути жалко",
     "смесь уверенности и непонимания — взрывоопасна",
     "впечатление, что разум на перекуре",
     "серьёзность заявления не спасает его глупость",
@@ -614,6 +615,8 @@ async def start(m: Message):
         "Я — Лорд Вербус. Команды:\n"
         "• /lord_summary — краткий отчёт по беседе\n"
         "• /lord_psych — психологический портрет участника (ответь на его сообщение или укажи @username)\n"
+        "• /my_achievements — ваши ачивки\n"
+        "• /ach_top — топ по ачивкам\n"
         "Просто говорите — я вмешаюсь, если нужно."
     )
 
@@ -630,6 +633,7 @@ async def on_text(m: Message):
              m.from_user.username if m.from_user else None,
              m.text, now_ts(), m.message_id)
         )
+        # Хук ачивок: инкремент счетчиков и проверка условий
         await ach_on_text_hook(m)
         # — обновляем карточку пользователя (для кликабельных имён в саммари)
         if m.from_user:
@@ -707,10 +711,15 @@ async def set_commands():
     commands_group = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
         BotCommand(command="lord_psych",  description="Психологический портрет участника"),
+        # Пользовательские команды ачивок — удобно видеть в меню
+        BotCommand(command="my_achievements", description="Мои ачивки"),
+        BotCommand(command="ach_top", description="Топ по ачивкам"),
     ]
     commands_private = [
         BotCommand(command="lord_summary", description="Краткий отчёт по беседе"),
         BotCommand(command="lord_psych",  description="Психологический портрет участника"),
+        BotCommand(command="my_achievements", description="Мои ачивки"),
+        BotCommand(command="ach_top", description="Топ по ачивкам"),
         BotCommand(command="start", description="Приветствие"),
     ]
     await bot.set_my_commands(commands_group, scope=BotCommandScopeAllGroupChats())
@@ -721,6 +730,8 @@ async def set_commands():
 # =========================
 async def main():
     init_db_with_achievements()
+    # <<< ВАЖНО: регистрируем роутер ачивок >>>
+    dp.include_router(ach_router)
     await set_commands()
     await dp.start_polling(bot)
 
