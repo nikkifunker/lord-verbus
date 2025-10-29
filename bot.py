@@ -723,6 +723,53 @@ async def set_commands():
     await bot.set_my_commands(commands_group, scope=BotCommandScopeAllGroupChats())
     await bot.set_my_commands(commands_private, scope=BotCommandScopeAllPrivateChats())
 
+@dp.message(Command("debug_ach"))
+async def debug_achievements(m: Message):
+    """Диагностика системы достижений"""
+    if not m.from_user:
+        await m.reply("❌ Не могу определить пользователя")
+        return
+    
+    try:
+        from achievements import ADMIN_IDS, is_admin, DB
+        import sqlite3
+        from contextlib import closing
+        
+        user_id = m.from_user.id
+        is_adm = is_admin(user_id)
+        
+        # Проверяем таблицы
+        with closing(sqlite3.connect(DB)) as conn:
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = [row[0] for row in cur.fetchall()]
+            
+            # Считаем ачивки
+            cur = conn.execute("SELECT COUNT(*) FROM achievements;")
+            ach_count = cur.fetchone()[0]
+            
+            # Считаем статы
+            cur = conn.execute("SELECT COUNT(*) FROM user_stats WHERE user_id=?;", (user_id,))
+            stats_count = cur.fetchone()[0]
+        
+        report = (
+            f"🔍 <b>Диагностика достижений</b>\n\n"
+            f"👤 Ваш ID: <code>{user_id}</code>\n"
+            f"🔑 Админ: {'✅ Да' if is_adm else '❌ Нет'}\n"
+            f"📋 ID админов: <code>{ADMIN_IDS}</code>\n\n"
+            f"💾 База данных: <code>{DB}</code>\n"
+            f"📊 Таблицы: {', '.join(tables)}\n\n"
+            f"🏆 Всего ачивок: {ach_count}\n"
+            f"📈 Ваша статистика: {stats_count} записей\n\n"
+            f"{'✅ Всё готово!' if is_adm else '⚠️ Добавьте свой ID в переменную окружения ADMIN_IDS'}"
+        )
+        
+        await m.reply(report)
+        
+    except Exception as e:
+        await m.reply(f"❌ Ошибка диагностики:\n<code>{e}</code>")
+        import traceback
+        print(traceback.format_exc())
+
 # =========================
 # Main
 # =========================
