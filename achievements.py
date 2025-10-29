@@ -164,11 +164,18 @@ def _title_desc(ach_row: tuple) -> tuple[str, str]:
     return ach_row[2], ach_row[3]
 
 def _find_achievement_by_code_or_id(code_or_id: str) -> tuple | None:
+    sql = """
+        SELECT id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
+        FROM achievements
+        WHERE {where}
+        LIMIT 1;
+    """
     if code_or_id.isdigit():
-        row = _q("SELECT * FROM achievements WHERE id=?;", (int(code_or_id),))
-        return row[0] if row else None
-    row = _q("SELECT * FROM achievements WHERE LOWER(code)=LOWER(?);", (code_or_id,))
-    return row[0] if row else None
+        rows = _q(sql.format(where="id=?"), (int(code_or_id),))
+    else:
+        rows = _q(sql.format(where="LOWER(code)=LOWER(?)"), (code_or_id,))
+    return rows[0] if rows else None
+
 
 def _ensure_user_stats(chat_id: int, user_id: int):
     _exec(
@@ -206,7 +213,12 @@ async def on_text_hook(m: Message):
     _ensure_user_stats(chat_id, user_id)
     _exec("UPDATE user_stats SET messages_count=messages_count+1 WHERE chat_id=? AND user_id=?;", (chat_id, user_id))
 
-    achs = _q("SELECT * FROM achievements WHERE active=1;")
+    achs = _q("""
+    SELECT id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
+    FROM achievements
+    WHERE active=1;
+""")
+
     if not achs:
         return
 
@@ -372,16 +384,19 @@ async def cmd_ach_del(m: Message, command: CommandObject):
     _exec("DELETE FROM achievements WHERE id=?;", (ach[0],))
     await m.reply("Удалено.")
 
-@router.message(Command("ach_list"))
+@router.message(Command("ach_list")))
 async def cmd_ach_list(m: Message):
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
-    rows = _q("SELECT id, code, title, kind, condition_type, thresholds, target_ts, active, extra_json FROM achievements ORDER BY id;")
+    rows = _q("""
+        SELECT id, code, title, kind, condition_type, thresholds, target_ts, active, extra_json
+        FROM achievements
+        ORDER BY id;
+    """)
     if not rows:
         return await m.reply("Список пуст.")
     parts = []
-    for r in rows:
-        rid, code, title, kind, ctype, thr, ts, active, extra_json = r
+    for (rid, code, title, kind, ctype, thr, ts, active, extra_json) in rows:
         data = []
         if ctype == "messages":
             data.append(f"thresholds={thr}")
@@ -390,11 +405,12 @@ async def cmd_ach_list(m: Message):
         else:
             try:
                 kw = json.loads(extra_json).get("keyword") if extra_json else None
-            except:
+            except Exception:
                 kw = None
             data.append(f"keyword={kw}; thresholds={thr}")
         parts.append(f"#{rid} <b>{title}</b> (<code>{code}</code>) — {kind}/{ctype}, {'; '.join(data)}, active={active}")
     await m.reply("\n".join(parts), disable_web_page_preview=True)
+
 
 @router.message(Command("ach_edit"))
 async def cmd_ach_edit(m: Message, command: CommandObject):
@@ -450,10 +466,13 @@ async def cmd_ach_progress(m: Message, command: CommandObject):
     if not code:
         return await m.reply("Укажите code или id ачивки.")
     ach = _find_achievement_by_code_or_id(code)
-    if not ach:
-        return await m.reply("Ачивка не найдена.")
-    (aid, _, title, _, kind, ctype, thr_json, target_ts, active) = ach
-    thresholds = _thresholds_for(ach)
+if not ach:
+    return await m.reply("Ачивка не найдена.")
+(aid, _, title, _, kind, ctype, thr_json, target_ts, active, extra_json) = ach
+try:
+    thresholds = sorted(set(map(int, json.loads(thr_json)))) if thr_json else []
+except Exception:
+    thresholds = []
 
     # Вытащим всех говоривших в этом чате + их счётчик
     rows = _q("""
