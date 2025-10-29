@@ -630,10 +630,15 @@ async def on_text(m: Message):
              m.from_user.username if m.from_user else None,
              m.text, now_ts(), m.message_id)
         )
-        # --- ХУК АЧИВОК (добавлено) ---
-        await ach_on_text_hook(m)
+        
+        # ===== ВОТ ЗДЕСЬ ВЫЗОВ АЧИВОК (КРИТИЧНО!) =====
+        try:
+            await ach_on_text_hook(m)
+        except Exception as e:
+            print(f"[ERROR] Achievements hook failed: {e}")
+        # =============================================
 
-        # — обновляем карточку пользователя (для кликабельных имён в саммари)
+        # — обновляем карточку пользователя
         if m.from_user:
             full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
             db_execute(
@@ -722,12 +727,20 @@ async def set_commands():
 # Main
 # =========================
 async def main():
-    # Инициализация БД с поддержкой ачивок (ВАЖНО: не трогаем вашу init_db())
+    # Инициализация БД с поддержкой ачивок
+    print("[INIT] Initializing database...")
     init_db_with_achievements()
-    # Регистрируем роутер ачивок (команды /ach_* и пользовательские)
+    print("[INIT] Database ready!")
+    
+    # Регистрируем роутер ачивок
+    print("[INIT] Registering achievements router...")
     dp.include_router(ach_router)
+    print("[INIT] Achievements ready!")
+    
     await set_commands()
+    print("[START] Bot is polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
