@@ -49,7 +49,6 @@ def init_db():
     with closing(_conn()) as c:
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
-        # Описание ачивок
         c.execute("""
         CREATE TABLE IF NOT EXISTS achievements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,13 +56,13 @@ def init_db():
             title TEXT NOT NULL,
             description TEXT NOT NULL,
             kind TEXT NOT NULL CHECK(kind IN ('single','tiered')),
-            condition_type TEXT NOT NULL CHECK(condition_type IN ('messages','date')),
-            thresholds TEXT,              -- JSON: [100,1000,10000] (для messages, когда tiered)
-            target_ts INTEGER,            -- для date (single)
-            active INTEGER NOT NULL DEFAULT 1
+            condition_type TEXT NOT NULL CHECK(condition_type IN ('messages','date','keyword')),
+            thresholds TEXT,
+            target_ts INTEGER,
+            active INTEGER NOT NULL DEFAULT 1,
+            extra_json TEXT
         );
         """)
-        # Прогресс/статистика пользователей в разрезе чатов
         c.execute("""
         CREATE TABLE IF NOT EXISTS user_stats (
             chat_id INTEGER NOT NULL,
@@ -72,7 +71,6 @@ def init_db():
             PRIMARY KEY(chat_id, user_id)
         );
         """)
-        # Полученные ачивки и тировые уровни
         c.execute("""
         CREATE TABLE IF NOT EXISTS user_achievements (
             chat_id INTEGER NOT NULL,
@@ -84,11 +82,39 @@ def init_db():
             FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
         );
         """)
+        # Миграция для старых БД (если столбца нет)
+        try:
+            c.execute("ALTER TABLE achievements ADD COLUMN extra_json TEXT;")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE achievements ADD COLUMN active INTEGER NOT NULL DEFAULT 1;")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE achievements ADD COLUMN target_ts INTEGER;")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE achievements ADD COLUMN thresholds TEXT;")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE achievements ADD COLUMN condition_type TEXT;")
+        except sqlite3.OperationalError:
+            pass
         c.commit()
+
 
 # =========
 # Helpers
 # =========
+def _ach_keyword(ach_row: tuple) -> str | None:
+    # ach_row — SELECT * FROM achievements
+    # extra_json = ach_row[10] если считать с нуля; но позиция может отличаться.
+    # Найдем индекс по имени столбца безопасно:
+    return json.loads(ach_row[-1]).get("keyword") if ach_row[-1] else None
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -172,34 +198,34 @@ async def _announce(m: Message, title: str, description: str, rarity: float, tie
 # Публичные хуки
 # =========
 async def on_text_hook(m: Message):
-    """
-    Вызывайте из вашего on_text сразу после логирования сообщения.
-    Инкремент счётчиков и проверка триггеров.
-    """
     if not m.from_user:
         return
     chat_id = m.chat.id
     user_id = m.from_user.id
 
-    # 1) нарастим счётчик сообщений
     _ensure_user_stats(chat_id, user_id)
     _exec("UPDATE user_stats SET messages_count=messages_count+1 WHERE chat_id=? AND user_id=?;", (chat_id, user_id))
 
-    # 2) проверим ачивки типа "messages" и "date"
     achs = _q("SELECT * FROM achievements WHERE active=1;")
     if not achs:
         return
 
-    # текущее значение счётчика сообщений
+    # текущее число сообщений (для типа messages)
     msg_cnt = _q("SELECT messages_count FROM user_stats WHERE chat_id=? AND user_id=?;", (chat_id, user_id))[0][0]
+    text = (m.text or m.caption or "")  # ловим текст и подписи
 
     for ach in achs:
-        (aid, code, title, desc, kind, ctype, thresholds_json, target_ts, active) = ach
-        # messages
+        (aid, code, title, desc, kind, ctype, thresholds_json, target_ts, active, extra_json) = ach
+        thresholds = []
+        if thresholds_json:
+            try:
+                thresholds = sorted(set(map(int, json.loads(thresholds_json))))
+            except:
+                thresholds = []
+
+        # тип messages
         if ctype == "messages":
-            thresholds = _thresholds_for(ach)
             if kind == "single":
-                # одна планка — берём первый порог
                 limit = thresholds[0] if thresholds else None
                 if limit and msg_cnt >= limit and not _user_has_tier(chat_id, user_id, aid, 1):
                     _exec("INSERT INTO user_achievements(chat_id, user_id, achievement_id, tier, unlocked_at) VALUES(?,?,?,?,?)",
@@ -207,83 +233,131 @@ async def on_text_hook(m: Message):
                     rarity = _calc_rarity(chat_id, aid)
                     await _announce(m, title, desc, rarity)
             else:
-                # tiered — проверим по всем порогам
-                thresholds_sorted = sorted(thresholds)
-                for idx, limit in enumerate(thresholds_sorted, start=1):
+                for idx, limit in enumerate(thresholds, start=1):
                     if msg_cnt >= limit and not _user_has_tier(chat_id, user_id, aid, idx):
                         _exec("INSERT INTO user_achievements(chat_id, user_id, achievement_id, tier, unlocked_at) VALUES(?,?,?,?,?)",
                               (chat_id, user_id, aid, idx, _now_ts()))
                         rarity = _calc_rarity(chat_id, aid)
-                        await _announce(m, title, desc, rarity, tier_label=f"{idx}/{len(thresholds_sorted)}")
+                        await _announce(m, title, desc, rarity, tier_label=f"{idx}/{len(thresholds)}")
 
-        # date
+        # тип date
         elif ctype == "date" and target_ts:
-            # Разовая выдача после наступления target_ts (при любой активности пользователя)
             if _now_ts() >= int(target_ts) and not _user_has_tier(chat_id, user_id, aid, 1):
                 _exec("INSERT INTO user_achievements(chat_id, user_id, achievement_id, tier, unlocked_at) VALUES(?,?,?,?,?)",
                       (chat_id, user_id, aid, 1, _now_ts()))
                 rarity = _calc_rarity(chat_id, aid)
                 await _announce(m, title, desc, rarity)
 
+        # тип keyword — считаем все исторические вхождения пользователя по messages.text LIKE
+        elif ctype == "keyword":
+            kw = None
+            try:
+                kw = json.loads(extra_json).get("keyword") if extra_json else None
+            except:
+                kw = None
+            if not kw:
+                continue
+
+            # Текущее сообщение содержит ключевое слово?
+            contains_now = kw.lower() in (text or "").lower()
+            if not contains_now:
+                continue
+
+            # Суммарные вхождения раньше и сейчас — считаем по таблице messages
+            # Допущение: у вас есть таблица messages(chat_id, user_id, text)
+            # Посчитаем сообщения пользователя, где встречается ключевое слово.
+            try:
+                total = _q("""
+                    SELECT COUNT(*) FROM messages
+                    WHERE chat_id=? AND user_id=? AND LOWER(text) LIKE LOWER(?) ;
+                """, (chat_id, user_id, f"%{kw}%"))[0][0]
+            except Exception:
+                # fallback: считаем только текущее вхождение
+                total = 1
+
+            if kind == "single":
+                limit = thresholds[0] if thresholds else None
+                if limit and total >= limit and not _user_has_tier(chat_id, user_id, aid, 1):
+                    _exec("INSERT INTO user_achievements(chat_id, user_id, achievement_id, tier, unlocked_at) VALUES(?,?,?,?,?)",
+                          (chat_id, user_id, aid, 1, _now_ts()))
+                    rarity = _calc_rarity(chat_id, aid)
+                    await _announce(m, title, desc, rarity)
+            else:
+                for idx, limit in enumerate(thresholds, start=1):
+                    if total >= limit and not _user_has_tier(chat_id, user_id, aid, idx):
+                        _exec("INSERT INTO user_achievements(chat_id, user_id, achievement_id, tier, unlocked_at) VALUES(?,?,?,?,?)",
+                              (chat_id, user_id, aid, idx, _now_ts()))
+                        rarity = _calc_rarity(chat_id, aid)
+                        await _announce(m, title, desc, rarity, tier_label=f"{idx}/{len(thresholds)}")
+
 # =========
 # Команды: админ
 # =========
 @router.message(Command("ach_add"))
 async def cmd_ach_add(m: Message, command: CommandObject):
-    """
-    Добавление ачивки.
-    Форматы:
-    1) messages + tiered:
-       /ach_add code|Заголовок|Описание|tiered|messages|100,1000,10000
-    2) messages + single:
-       /ach_add code|Заголовок|Описание|single|messages|100
-    3) date + single:
-       /ach_add code|Заголовок|Описание|single|date|2025-12-31
-    """
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
 
     args = (command.args or "").split("|")
     if len(args) != 6:
-        return await m.reply("Формат: /ach_add code|title|description|kind(single|tiered)|condition(messages|date)|data")
+        return await m.reply(
+            "Формат:\n"
+            "1) /ach_add code|title|description|tiered|messages|100,1000\n"
+            "2) /ach_add code|title|description|single|messages|100\n"
+            "3) /ach_add code|title|description|single|date|YYYY-MM-DD\n"
+            "4) /ach_add code|title|description|tiered|keyword:WORD|1,3,5"
+        )
 
     code, title, desc, kind, cond, data = [a.strip() for a in args]
-
     if kind not in ("single", "tiered"):
-        return await m.reply("kind должен быть single или tiered")
-    if cond not in ("messages", "date"):
-        return await m.reply("condition должен быть messages или date")
+        return await m.reply("kind: single|tiered")
+
+    # cond может быть 'messages', 'date' или 'keyword:WORD'
+    cond_type = cond
+    keyword = None
+    if cond.startswith("keyword:"):
+        cond_type = "keyword"
+        keyword = cond.split(":", 1)[1].strip()
+        if not keyword:
+            return await m.reply("Укажите слово после keyword:, напр. keyword:testtest")
+
+    if cond_type not in ("messages", "date", "keyword"):
+        return await m.reply("condition: messages | date | keyword:<word>")
 
     thresholds_json = None
     target_ts = None
+    extra_json = None
 
     try:
-        if cond == "messages":
+        if cond_type == "messages":
             thresholds = _parse_thresholds(data)
             if kind == "single" and len(thresholds) != 1:
                 return await m.reply("Для single укажите ровно один порог.")
             thresholds_json = json.dumps(thresholds)
-        else:  # date
-            # принимаем YYYY-MM-DD
-            try:
-                y, mo, d = map(int, data.split("-"))
-                dt = datetime(y, mo, d, 23, 59, 59, tzinfo=timezone.utc)
-                target_ts = int(dt.timestamp())
-            except Exception:
-                return await m.reply("Для date используйте формат YYYY-MM-DD (например 2025-12-31).")
+        elif cond_type == "date":
+            y, mo, d = map(int, data.split("-"))
+            dt = datetime(y, mo, d, 23, 59, 59, tzinfo=timezone.utc)
+            target_ts = int(dt.timestamp())
+        else:  # keyword
+            thresholds = _parse_thresholds(data)
+            if kind == "single" and len(thresholds) != 1:
+                return await m.reply("Для single укажите ровно один порог.")
+            thresholds_json = json.dumps(thresholds)
+            extra_json = json.dumps({"keyword": keyword})
     except Exception as e:
         return await m.reply(f"Ошибка параметров: {e}")
 
     try:
         _exec("""
-            INSERT INTO achievements(code,title,description,kind,condition_type,thresholds,target_ts,active)
-            VALUES(?,?,?,?,?,?,?,1);
-        """, (code, title, desc, kind, cond, thresholds_json, target_ts))
+            INSERT INTO achievements(code,title,description,kind,condition_type,thresholds,target_ts,active,extra_json)
+            VALUES(?,?,?,?,?,?,?,?,?);
+        """, (code, title, desc, kind, cond_type, thresholds_json, target_ts, 1, extra_json))
         await m.reply(f"✅ Ачивка добавлена: <b>{title}</b> (code: <code>{code}</code>)")
     except sqlite3.IntegrityError:
         await m.reply("Ачивка с таким code уже существует.")
     except Exception as e:
         await m.reply(f"Ошибка: {e}")
+
 
 @router.message(Command("ach_del"))
 async def cmd_ach_del(m: Message, command: CommandObject):
@@ -302,17 +376,23 @@ async def cmd_ach_del(m: Message, command: CommandObject):
 async def cmd_ach_list(m: Message):
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
-    rows = _q("SELECT id, code, title, kind, condition_type, thresholds, target_ts, active FROM achievements ORDER BY id;")
+    rows = _q("SELECT id, code, title, kind, condition_type, thresholds, target_ts, active, extra_json FROM achievements ORDER BY id;")
     if not rows:
         return await m.reply("Список пуст.")
     parts = []
     for r in rows:
-        rid, code, title, kind, ctype, thr, ts, active = r
+        rid, code, title, kind, ctype, thr, ts, active, extra_json = r
         data = []
         if ctype == "messages":
             data.append(f"thresholds={thr}")
-        else:
+        elif ctype == "date":
             data.append(f"date_ts={ts}")
+        else:
+            try:
+                kw = json.loads(extra_json).get("keyword") if extra_json else None
+            except:
+                kw = None
+            data.append(f"keyword={kw}; thresholds={thr}")
         parts.append(f"#{rid} <b>{title}</b> (<code>{code}</code>) — {kind}/{ctype}, {'; '.join(data)}, active={active}")
     await m.reply("\n".join(parts), disable_web_page_preview=True)
 
