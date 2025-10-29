@@ -438,7 +438,7 @@ async def cmd_ach_add(m: Message, command: CommandObject):
     except Exception as e:
         await m.reply(f"Ошибка: {e}")
 
-@router.message(Command("ach_del")))
+@router.message(Command("ach_del"))
 async def cmd_ach_del(m: Message, command: CommandObject):
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
