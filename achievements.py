@@ -272,6 +272,28 @@ def _user_has_tier(chat_id: int, user_id: int, ach_id: int, tier: int) -> bool:
     )
     return bool(row)
 
+def _user_max_tier(chat_id: int, user_id: int, ach_id: int) -> int:
+    row = _q(
+        "SELECT COALESCE(MAX(tier), 0) FROM user_achievements WHERE chat_id=? AND user_id=? AND achievement_id=?;",
+        (chat_id, user_id, ach_id)
+    )
+    return int(row[0][0] or 0)
+
+def _next_tier_to_award(thresholds: list[int], total: int, current_tier: int) -> int | None:
+    """
+    Возвращает СЛЕДУЮЩИЙ (ровно +1) уровень, если его порог уже достигнут.
+    Если текущий 0 и total >= thresholds[0] -> вернёт 1.
+    Если текущий 1 и total >= thresholds[1] -> вернёт 2.
+    И т.д. Иначе None.
+    """
+    if not thresholds:
+        return None
+    # индексы уровней: 1..N
+    next_idx = current_tier + 1
+    if 1 <= next_idx <= len(thresholds) and total >= thresholds[next_idx - 1]:
+        return next_idx
+    return None
+
 def _unlock(chat_id: int, user_id: int, ach_id: int, tier: int):
     _exec(
         "INSERT INTO user_achievements(chat_id, user_id, achievement_id, tier, unlocked_at) VALUES(?,?,?,?,?)",
@@ -282,16 +304,21 @@ def _unlock(chat_id: int, user_id: int, ach_id: int, tier: int):
 # Публичный хук (вызывать после логирования сообщения)
 # =========
 async def on_text_hook(m: Message):
+    """
+    Вызывайте из вашего on_text сразу после логирования сообщения.
+    Инкремент счётчиков и проверка триггеров.
+    ВАЖНО: выдаётся только ОДИН следующий уровень за одно сообщение.
+    """
     if not m.from_user:
         return
     chat_id = m.chat.id
     user_id = m.from_user.id
 
-    # учёт сообщений
+    # 1) счётчик сообщений
     _exec("INSERT OR IGNORE INTO user_stats(chat_id, user_id) VALUES(?, ?);", (chat_id, user_id))
     _exec("UPDATE user_stats SET messages_count=messages_count+1 WHERE chat_id=? AND user_id=?;", (chat_id, user_id))
 
-    # активные ачивки
+    # 2) активные ачивки
     achs = _q("""
         SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
         FROM achievements
@@ -300,33 +327,37 @@ async def on_text_hook(m: Message):
     if not achs:
         return
 
+    # текущий счетчик сообщений пользователя
     msg_cnt = _q("SELECT messages_count FROM user_stats WHERE chat_id=? AND user_id=?;", (chat_id, user_id))[0][0]
     text = (m.text or m.caption or "")
 
-    for aid, code, title, desc, kind, ctype, thr_json, target_ts, active, extra_json in achs:
+    for (aid, code, title, desc, kind, ctype, thresholds_json, target_ts, active, extra_json) in achs:
         # thresholds
         try:
-            thresholds = sorted(set(map(int, json.loads(thr_json)))) if thr_json else []
+            thresholds = sorted(set(map(int, json.loads(thresholds_json)))) if thresholds_json else []
         except Exception:
             thresholds = []
 
-        if ctype == "messages":
-            if kind == "single":
-                limit = thresholds[0] if thresholds else None
-                if limit and msg_cnt >= limit and not _user_has_tier(chat_id, user_id, aid, 1):
-                    _unlock(chat_id, user_id, aid, 1)
-                    await _announce(m, title, desc, _calc_rarity(chat_id, aid))
-            else:
-                for idx, limit in enumerate(thresholds, start=1):
-                    if msg_cnt >= limit and not _user_has_tier(chat_id, user_id, aid, idx):
-                        _unlock(chat_id, user_id, aid, idx)
-                        await _announce(m, title, desc, _calc_rarity(chat_id, aid), tier_label=f"{idx}/{len(thresholds)}")
+        # --- SINGLE-STEP режим: выдаём ровно один следующий уровень ---
+        curr_tier = _user_max_tier(chat_id, user_id, aid)
 
+        # messages
+        if ctype == "messages":
+            total = msg_cnt  # «прогресс» по этой ачивке
+            next_tier = _next_tier_to_award(thresholds, total, curr_tier) if kind == "tiered" else (1 if thresholds and total >= thresholds[0] and curr_tier == 0 else None)
+            if next_tier:
+                _unlock(chat_id, user_id, aid, next_tier)
+                rarity = _calc_rarity(chat_id, aid)
+                tier_label = f"{next_tier}/{len(thresholds)}" if kind == "tiered" else None
+                await _announce(m, title, desc, rarity, tier_label=tier_label)
+
+        # date (разовая)
         elif ctype == "date" and target_ts:
-            if _now_ts() >= int(target_ts) and not _user_has_tier(chat_id, user_id, aid, 1):
+            if curr_tier == 0 and _now_ts() >= int(target_ts):
                 _unlock(chat_id, user_id, aid, 1)
                 await _announce(m, title, desc, _calc_rarity(chat_id, aid))
 
+        # keyword
         elif ctype == "keyword":
             kw = None
             try:
@@ -335,26 +366,27 @@ async def on_text_hook(m: Message):
                 kw = None
             if not kw:
                 continue
-            if kw.lower() not in (text or "").lower():
+
+            # текущий меседж должен содержать ключевое слово (чтобы не выдавать «вхолостую»)
+            contains_now = kw.lower() in (text or "").lower()
+            if not contains_now:
                 continue
-            # считаем исторические вхождения
+
+            # «прогресс» — число сообщений пользователя с ключевым словом
             try:
                 total = _q("""
                     SELECT COUNT(*) FROM messages
                     WHERE chat_id=? AND user_id=? AND LOWER(text) LIKE LOWER(?);
                 """, (chat_id, user_id, f"%{kw}%"))[0][0]
             except Exception:
-                total = 1
-            if kind == "single":
-                limit = thresholds[0] if thresholds else None
-                if limit and total >= limit and not _user_has_tier(chat_id, user_id, aid, 1):
-                    _unlock(chat_id, user_id, aid, 1)
-                    await _announce(m, title, desc, _calc_rarity(chat_id, aid))
-            else:
-                for idx, limit in enumerate(thresholds, start=1):
-                    if total >= limit and not _user_has_tier(chat_id, user_id, aid, idx):
-                        _unlock(chat_id, user_id, aid, idx)
-                        await _announce(m, title, desc, _calc_rarity(chat_id, aid), tier_label=f"{idx}/{len(thresholds)}")
+                total = 1  # fallback, если таблицы messages нет/сломана
+
+            next_tier = _next_tier_to_award(thresholds, total, curr_tier) if kind == "tiered" else (1 if thresholds and total >= thresholds[0] and curr_tier == 0 else None)
+            if next_tier:
+                _unlock(chat_id, user_id, aid, next_tier)
+                rarity = _calc_rarity(chat_id, aid)
+                tier_label = f"{next_tier}/{len(thresholds)}" if kind == "tiered" else None
+                await _announce(m, title, desc, rarity, tier_label=tier_label)
 
 # =========
 # Поиск ачивки
