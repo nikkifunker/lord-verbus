@@ -15,6 +15,8 @@ from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.types import Message, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from achievements import router as ach_router, init_db as ach_init_db, on_text_hook as ach_on_text_hook
+
 
 # =========================
 # Config
@@ -87,6 +89,12 @@ def init_db():
         );
         """)
         conn.commit()
+        
+def init_db_with_achievements():
+    # базовые таблицы
+    init_db()
+    # таблицы ачивок
+    ach_init_db()
 
 def db_execute(sql: str, params: tuple = ()):
     with closing(sqlite3.connect(DB)) as conn:
@@ -622,6 +630,7 @@ async def on_text(m: Message):
              m.from_user.username if m.from_user else None,
              m.text, now_ts(), m.message_id)
         )
+        await ach_on_text_hook(m)
         # — обновляем карточку пользователя (для кликабельных имён в саммари)
         if m.from_user:
             full_name = (m.from_user.full_name or "").strip() or (m.from_user.first_name or "")
@@ -711,7 +720,7 @@ async def set_commands():
 # Main
 # =========================
 async def main():
-    init_db()
+    init_db_with_achievements()
     await set_commands()
     await dp.start_polling(bot)
 
