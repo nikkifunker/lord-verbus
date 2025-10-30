@@ -55,6 +55,165 @@ def _table_cols(name: str) -> list[str]:
         cur = c.execute(f"PRAGMA table_info({name});")
         return [r[1] for r in cur.fetchall()]  # name = index 1
 
+
+def _table_exists_conn(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", (name,))
+    return cur.fetchone() is not None
+
+
+def _table_cols_conn(conn: sqlite3.Connection, name: str) -> set[str]:
+    if not _table_exists_conn(conn, name):
+        return set()
+    cur = conn.execute(f"PRAGMA table_info({name});")
+    return {row[1] for row in cur.fetchall()}
+
+
+def _delete_optional_records(
+    conn: sqlite3.Connection,
+    table: str,
+    column_values: dict[str, Any],
+) -> int:
+    columns = _table_cols_conn(conn, table)
+    if not columns:
+        return 0
+    filtered = [(col, val) for col, val in column_values.items() if val is not None and col in columns]
+    if not filtered:
+        return 0
+    where = " AND ".join(f"{col}=?" for col, _ in filtered)
+    cur = conn.execute(f"DELETE FROM {table} WHERE {where};", tuple(val for _, val in filtered))
+    return cur.rowcount
+
+
+def _remove_progress_records(
+    conn: sqlite3.Connection,
+    *,
+    ach_code: str,
+    ach_id: int,
+    chat_id: int | None,
+    user_id: int | None,
+) -> int:
+    targets = (
+        "achievements_progress",
+        "achievement_progress",
+        "achievements_states",
+        "achievement_states",
+        "achievements_awards",
+    )
+    total = 0
+    for table in targets:
+        total += _delete_optional_records(
+            conn,
+            table,
+            {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "achievement_id": ach_id,
+                "ach_id": ach_id,
+                "achievement_code": ach_code,
+                "ach_code": ach_code,
+                "code": ach_code,
+            },
+        )
+    return total
+
+
+def delete_user_achievement(chat_id: int, user_id: int, ach_code: str) -> int:
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN")
+        try:
+            ach_row = conn.execute(
+                "SELECT COALESCE(id,rowid) FROM achievements WHERE LOWER(code)=LOWER(?) LIMIT 1;",
+                (ach_code,),
+            ).fetchone()
+            if not ach_row:
+                conn.rollback()
+                return 0
+            ach_id = int(ach_row[0])
+            total = 0
+            total += _delete_optional_records(
+                conn,
+                "user_achievements",
+                {"chat_id": chat_id, "user_id": user_id, "achievement_id": ach_id},
+            )
+            total += _remove_progress_records(
+                conn,
+                ach_code=ach_code,
+                ach_id=ach_id,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+            conn.commit()
+            return total
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def reset_user_achievement_progress(chat_id: int, user_id: int, ach_code: str) -> int:
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN")
+        try:
+            ach_row = conn.execute(
+                "SELECT COALESCE(id,rowid) FROM achievements WHERE LOWER(code)=LOWER(?) LIMIT 1;",
+                (ach_code,),
+            ).fetchone()
+            if not ach_row:
+                conn.rollback()
+                return 0
+            ach_id = int(ach_row[0])
+            removed = _remove_progress_records(
+                conn,
+                ach_code=ach_code,
+                ach_id=ach_id,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+            conn.commit()
+            return removed
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def delete_achievement_globally(ach_code: str) -> int:
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN")
+        try:
+            ach_row = conn.execute(
+                "SELECT COALESCE(id,rowid) FROM achievements WHERE LOWER(code)=LOWER(?) LIMIT 1;",
+                (ach_code,),
+            ).fetchone()
+            if not ach_row:
+                conn.rollback()
+                return 0
+            ach_id = int(ach_row[0])
+            total = 0
+            total += _delete_optional_records(
+                conn,
+                "user_achievements",
+                {"achievement_id": ach_id},
+            )
+            total += _remove_progress_records(
+                conn,
+                ach_code=ach_code,
+                ach_id=ach_id,
+                chat_id=None,
+                user_id=None,
+            )
+            total += _delete_optional_records(
+                conn,
+                "achievements",
+                {"id": ach_id, "code": ach_code},
+            )
+            conn.commit()
+            return total
+        except Exception:
+            conn.rollback()
+            raise
+
 def _rebuild_achievements_if_needed():
     cols = _table_cols("achievements")
     need_rebuild = ("id" not in cols)
@@ -264,18 +423,15 @@ async def _announce(
     description: str,
     rarity: float,
     level: int | None = None,
-    progress: tuple[int, int] | None = None,
 ):
     if not m.from_user:
         return
     text = format_achievement_message(
         user_id=m.from_user.id,
         user_name=m.from_user.full_name,
-        ach_code=code,
         ach_title=title,
         level=level,
         description=description,
-        progress=progress,
     )
     text = f"{text}\n<i>Редкость:</i> <b>{rarity}%</b>"
     await send_achievement_award(m.bot, m.chat.id, text)
@@ -363,12 +519,6 @@ async def on_text_hook(m: Message):
             if next_tier:
                 _unlock(chat_id, user_id, aid, next_tier)
                 rarity = _calc_rarity(chat_id, aid)
-                goal = None
-                if thresholds and 0 <= next_tier - 1 < len(thresholds):
-                    goal = thresholds[next_tier - 1]
-                progress = None
-                if goal:
-                    progress = (total, goal)
                 level = next_tier if kind == "tiered" else None
                 await _announce(
                     m,
@@ -377,7 +527,6 @@ async def on_text_hook(m: Message):
                     desc,
                     rarity,
                     level=level,
-                    progress=progress,
                 )
 
         # date (разовая)
@@ -420,12 +569,6 @@ async def on_text_hook(m: Message):
             if next_tier:
                 _unlock(chat_id, user_id, aid, next_tier)
                 rarity = _calc_rarity(chat_id, aid)
-                goal = None
-                if thresholds and 0 <= next_tier - 1 < len(thresholds):
-                    goal = thresholds[next_tier - 1]
-                progress = None
-                if goal:
-                    progress = (total, goal)
                 level = next_tier if kind == "tiered" else None
                 await _announce(
                     m,
@@ -434,7 +577,6 @@ async def on_text_hook(m: Message):
                     desc,
                     rarity,
                     level=level,
-                    progress=progress,
                 )
 
 # =========
@@ -669,8 +811,13 @@ async def cmd_ach_reset(m: Message, command: CommandObject):
             user_id = int(u)
         except Exception:
             return await m.reply("Некорректный user.")
-    _exec("DELETE FROM user_achievements WHERE chat_id=? AND user_id=? AND achievement_id=?;", (m.chat.id, user_id, ach[0]))
-    await m.reply("Сброшено.")
+    progress_removed = reset_user_achievement_progress(m.chat.id, user_id, ach[1])
+    awards_removed = delete_user_achievement(m.chat.id, user_id, ach[1])
+    await m.reply(
+        "Сброшено. "
+        + f"Удалено наград: {awards_removed}. "
+        + f"Записей прогресса очищено: {progress_removed}."
+    )
 
 # =========
 # Команды: для всех
