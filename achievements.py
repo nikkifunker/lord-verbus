@@ -10,6 +10,9 @@ from aiogram import Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
+from utils.achievements_format import format_achievement_message
+from utils.sender import send_achievement_award
+
 # =========
 # Конфиг
 # =========
@@ -254,16 +257,28 @@ def _calc_rarity(chat_id: int, achievement_id: int) -> float:
     got_share = have / total
     return round(max(0.0, 100.0 - got_share * 100.0), 2)
 
-async def _announce(m: Message, title: str, description: str, rarity: float, tier_label: str | None = None):
-    tier_suffix = f"\n<i>Уровень:</i> <b>{tier_label}</b>" if tier_label else ""
-    text = (
-        f"<b>Поздравляю!</b> Добыта ачивка 🎖️\n\n"
-        f"<b>{title}</b>\n"
-        f"{description}\n"
-        f"{tier_suffix}\n"
-        f"\n<i>Редкость:</i> <b>{rarity}%</b>"
+async def _announce(
+    m: Message,
+    code: str,
+    title: str,
+    description: str,
+    rarity: float,
+    level: int | None = None,
+    progress: tuple[int, int] | None = None,
+):
+    if not m.from_user:
+        return
+    text = format_achievement_message(
+        user_id=m.from_user.id,
+        user_name=m.from_user.full_name,
+        ach_code=code,
+        ach_title=title,
+        level=level,
+        description=description,
+        progress=progress,
     )
-    await m.answer(_pretty_box(text), disable_web_page_preview=True)
+    text = f"{text}\n<i>Редкость:</i> <b>{rarity}%</b>"
+    await send_achievement_award(m.bot, m.chat.id, text)
 
 def _user_has_tier(chat_id: int, user_id: int, ach_id: int, tier: int) -> bool:
     row = _q(
@@ -348,14 +363,34 @@ async def on_text_hook(m: Message):
             if next_tier:
                 _unlock(chat_id, user_id, aid, next_tier)
                 rarity = _calc_rarity(chat_id, aid)
-                tier_label = f"{next_tier}/{len(thresholds)}" if kind == "tiered" else None
-                await _announce(m, title, desc, rarity, tier_label=tier_label)
+                goal = None
+                if thresholds and 0 <= next_tier - 1 < len(thresholds):
+                    goal = thresholds[next_tier - 1]
+                progress = None
+                if goal:
+                    progress = (total, goal)
+                level = next_tier if kind == "tiered" else None
+                await _announce(
+                    m,
+                    code,
+                    title,
+                    desc,
+                    rarity,
+                    level=level,
+                    progress=progress,
+                )
 
         # date (разовая)
         elif ctype == "date" and target_ts:
             if curr_tier == 0 and _now_ts() >= int(target_ts):
                 _unlock(chat_id, user_id, aid, 1)
-                await _announce(m, title, desc, _calc_rarity(chat_id, aid))
+                await _announce(
+                    m,
+                    code,
+                    title,
+                    desc,
+                    _calc_rarity(chat_id, aid),
+                )
 
         # keyword
         elif ctype == "keyword":
@@ -385,8 +420,22 @@ async def on_text_hook(m: Message):
             if next_tier:
                 _unlock(chat_id, user_id, aid, next_tier)
                 rarity = _calc_rarity(chat_id, aid)
-                tier_label = f"{next_tier}/{len(thresholds)}" if kind == "tiered" else None
-                await _announce(m, title, desc, rarity, tier_label=tier_label)
+                goal = None
+                if thresholds and 0 <= next_tier - 1 < len(thresholds):
+                    goal = thresholds[next_tier - 1]
+                progress = None
+                if goal:
+                    progress = (total, goal)
+                level = next_tier if kind == "tiered" else None
+                await _announce(
+                    m,
+                    code,
+                    title,
+                    desc,
+                    rarity,
+                    level=level,
+                    progress=progress,
+                )
 
 # =========
 # Поиск ачивки
