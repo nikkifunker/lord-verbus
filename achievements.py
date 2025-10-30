@@ -134,15 +134,7 @@ def delete_user_achievement(chat_id: int, user_id: int, ach_code: str) -> int:
             total += _delete_optional_records(
                 conn,
                 "user_achievements",
-                {
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "achievement_id": ach_id,
-                    "ach_id": ach_id,
-                    "achievement_code": ach_code,
-                    "ach_code": ach_code,
-                    "code": ach_code,
-                },
+                {"chat_id": chat_id, "user_id": user_id, "achievement_id": ach_id},
             )
             total += _remove_progress_records(
                 conn,
@@ -202,13 +194,7 @@ def delete_achievement_globally(ach_code: str) -> int:
             total += _delete_optional_records(
                 conn,
                 "user_achievements",
-                {
-                    "achievement_id": ach_id,
-                    "ach_id": ach_id,
-                    "achievement_code": ach_code,
-                    "ach_code": ach_code,
-                    "code": ach_code,
-                },
+                {"achievement_id": ach_id},
             )
             total += _remove_progress_records(
                 conn,
