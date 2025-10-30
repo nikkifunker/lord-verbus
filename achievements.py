@@ -4,6 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
+from html import escape
 from typing import Any
 
 from aiogram import Router
@@ -339,6 +340,59 @@ def _rebuild_user_achievements_if_needed():
             c.execute("ALTER TABLE user_achievements_new RENAME TO user_achievements;")
             c.commit()
 
+
+def _rebuild_achievement_progress_if_needed():
+    cols = _table_cols("achievement_progress")
+    need_rebuild = not cols or any(
+        c not in cols for c in ("chat_id", "user_id", "achievement_id", "progress", "updated_at")
+    )
+    with closing(_conn()) as c:
+        if need_rebuild:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS achievement_progress_new (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    achievement_id INTEGER NOT NULL,
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, user_id, achievement_id),
+                    FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
+                );
+                """
+            )
+            if cols:
+                available = set(cols)
+                try:
+                    select_cols = []
+                    for col in ("chat_id", "user_id", "achievement_id", "progress", "updated_at"):
+                        if col in available:
+                            select_cols.append(col)
+                        elif col == "updated_at":
+                            select_cols.append("strftime('%s','now')")
+                        else:
+                            select_cols.append("0")
+                    c.execute(
+                        """
+                        INSERT OR IGNORE INTO achievement_progress_new
+                        (chat_id, user_id, achievement_id, progress, updated_at)
+                        SELECT {chat_id}, {user_id}, {achievement_id}, {progress}, {updated_at}
+                        FROM achievement_progress;
+                        """.format(
+                            chat_id=select_cols[0],
+                            user_id=select_cols[1],
+                            achievement_id=select_cols[2],
+                            progress=select_cols[3],
+                            updated_at=select_cols[4],
+                        )
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                c.execute("DROP TABLE achievement_progress;")
+            c.execute("ALTER TABLE achievement_progress_new RENAME TO achievement_progress;")
+            c.commit()
+
+
 def init_db():
     # базовое создание (если первый запуск)
     with closing(_conn()) as c:
@@ -377,11 +431,23 @@ def init_db():
             FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
         );
         """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS achievement_progress (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            achievement_id INTEGER NOT NULL,
+            progress INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(chat_id, user_id, achievement_id),
+            FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
+        );
+        """)
         c.commit()
     # миграции для любых старых схем
     _rebuild_achievements_if_needed()
     _rebuild_user_stats_if_needed()
     _rebuild_user_achievements_if_needed()
+    _rebuild_achievement_progress_if_needed()
 
 # =========
 # Helpers
@@ -498,8 +564,6 @@ async def on_text_hook(m: Message):
     if not achs:
         return
 
-    # текущий счетчик сообщений пользователя
-    msg_cnt = _q("SELECT messages_count FROM user_stats WHERE chat_id=? AND user_id=?;", (chat_id, user_id))[0][0]
     text = (m.text or m.caption or "")
 
     for (aid, code, title, desc, kind, ctype, thresholds_json, target_ts, active, extra_json) in achs:
@@ -514,7 +578,7 @@ async def on_text_hook(m: Message):
 
         # messages
         if ctype == "messages":
-            total = msg_cnt  # «прогресс» по этой ачивке
+            total = _increment_progress(chat_id, user_id, aid, 1)
             next_tier = _next_tier_to_award(thresholds, total, curr_tier) if kind == "tiered" else (1 if thresholds and total >= thresholds[0] and curr_tier == 0 else None)
             if next_tier:
                 _unlock(chat_id, user_id, aid, next_tier)
@@ -557,13 +621,7 @@ async def on_text_hook(m: Message):
                 continue
 
             # «прогресс» — число сообщений пользователя с ключевым словом
-            try:
-                total = _q("""
-                    SELECT COUNT(*) FROM messages
-                    WHERE chat_id=? AND user_id=? AND LOWER(text) LIKE LOWER(?);
-                """, (chat_id, user_id, f"%{kw}%"))[0][0]
-            except Exception:
-                total = 1  # fallback, если таблицы messages нет/сломана
+            total = _increment_progress(chat_id, user_id, aid, 1)
 
             next_tier = _next_tier_to_award(thresholds, total, curr_tier) if kind == "tiered" else (1 if thresholds and total >= thresholds[0] and curr_tier == 0 else None)
             if next_tier:
@@ -758,39 +816,133 @@ async def cmd_ach_progress(m: Message, command: CommandObject):
     except Exception:
         thresholds = []
 
-    rows = _q("""
-        SELECT s.user_id, s.messages_count
-        FROM user_stats s
-        WHERE s.chat_id=?
-        ORDER BY s.messages_count DESC;
-    """, (m.chat.id,))
-    if not rows:
-        return await m.reply("Пока нет данных по этому чату.")
-
     lines = [f"<b>Прогресс по</b> «{title}»:"]
 
     if ctype == "messages":
-        for uid, msg_cnt in rows[:50]:
-            taken = _q("""
-                SELECT MAX(tier) FROM user_achievements
-                WHERE chat_id=? AND user_id=? AND achievement_id=?;
-            """, (m.chat.id, uid, aid))[0][0] or 0
-            next_thr = None
-            for i, t in enumerate(sorted(thresholds), start=1):
-                if msg_cnt < t:
-                    next_thr = t
-                    break
-            status = f"все уровни ({taken}/{len(thresholds)})" if next_thr is None and thresholds else f"{msg_cnt} / {next_thr or '-'}"
-            lines.append(f"• user_id={uid}: {status}")
+        rows = _q(
+            """
+            SELECT user_id, progress
+            FROM achievement_progress
+            WHERE achievement_id=? AND chat_id=?
+            ORDER BY progress DESC, user_id ASC;
+            """,
+            (aid, m.chat.id),
+        )
+        if not rows:
+            lines.append("Данных по прогрессу пока нет.")
+        else:
+            profiles = _fetch_user_profiles({int(uid) for uid, _ in rows[:50]})
+            for uid, progress_val in rows[:50]:
+                uid = int(uid)
+                taken = _q(
+                    """
+                    SELECT MAX(tier) FROM user_achievements
+                    WHERE chat_id=? AND user_id=? AND achievement_id=?;
+                    """,
+                    (m.chat.id, uid, aid),
+                )[0][0] or 0
+                next_thr = None
+                for idx, threshold in enumerate(sorted(thresholds), start=1):
+                    if progress_val < threshold:
+                        next_thr = threshold
+                        break
+                status = (
+                    f"все уровни ({taken}/{len(thresholds)})"
+                    if next_thr is None and thresholds
+                    else f"{progress_val} / {next_thr or '-'}"
+                )
+                mention = _format_user_mention(uid, profiles)
+                lines.append(f"• {mention}: {status}")
     elif ctype == "keyword":
         try:
             kw = json.loads(extra_json).get("keyword") if extra_json else None
         except Exception:
             kw = None
+        rows = _q(
+            """
+            SELECT user_id, progress
+            FROM achievement_progress
+            WHERE achievement_id=? AND chat_id=?
+            ORDER BY progress DESC, user_id ASC;
+            """,
+            (aid, m.chat.id),
+        )
         lines.append(f"Тип: keyword, слово: <code>{kw}</code>")
+        if rows:
+            profiles = _fetch_user_profiles({int(uid) for uid, _ in rows[:50]})
+            for uid, progress_val in rows[:50]:
+                mention = _format_user_mention(int(uid), profiles)
+                lines.append(f"• {mention}: {progress_val}")
+        else:
+            lines.append("Данных по прогрессу пока нет.")
     else:
         lines.append("Тип: date — выдаётся автоматически после наступления даты при любой активности.")
-    await m.reply("\n".join(lines))
+    await m.reply("\n".join(lines), disable_web_page_preview=True)
+
+
+@router.message(Command("ach_globalview"))
+async def cmd_ach_globalview(m: Message):
+    if not m.from_user or not is_admin(m.from_user.id):
+        return await m.reply("Недостаточно прав.")
+    achs = _q(
+        """
+        SELECT COALESCE(id,rowid) AS id, code, title, kind, condition_type
+        FROM achievements
+        ORDER BY id;
+        """
+    )
+    if not achs:
+        return await m.reply("Ачивок нет в базе.")
+    blocks: list[str] = []
+    for aid, code, title, kind, ctype in achs:
+        block_lines = [
+            f"<b>#{aid}</b> — <b>{escape(title)}</b> (<code>{escape(code)}</code>)",
+            f"Тип: {kind}/{ctype}",
+        ]
+        progress_rows = _q(
+            """
+            SELECT chat_id, user_id, progress
+            FROM achievement_progress
+            WHERE achievement_id=?
+            ORDER BY progress DESC, user_id ASC
+            LIMIT 50;
+            """,
+            (aid,),
+        )
+        awards_rows = _q(
+            """
+            SELECT chat_id, user_id, MAX(tier) AS max_tier
+            FROM user_achievements
+            WHERE achievement_id=?
+            GROUP BY chat_id, user_id;
+            """,
+            (aid,),
+        )
+        progress_map = {(int(chat), int(user)): int(progress) for chat, user, progress in progress_rows}
+        awards_map = {(int(chat), int(user)): int(tier) for chat, user, tier in awards_rows}
+        keys = set(progress_map.keys()) | set(awards_map.keys())
+        if not keys:
+            block_lines.append("  • записей не найдено")
+        else:
+            user_ids = {uid for _, uid in keys}
+            profiles = _fetch_user_profiles(user_ids)
+            for chat_user in sorted(
+                keys,
+                key=lambda cu: (-progress_map.get(cu, 0), cu[0], cu[1]),
+            ):
+                chat_id, user_id = chat_user
+                mention = _format_user_mention(user_id, profiles)
+                progress_val = progress_map.get(chat_user, 0)
+                tier_val = awards_map.get(chat_user)
+                tier_text = f", уровни: {tier_val}" if tier_val else ""
+                block_lines.append(
+                    f"  • чат <code>{chat_id}</code>: {mention} — прогресс: {progress_val}{tier_text}"
+                )
+            if len(keys) >= 50:
+                block_lines.append("  • … (обрезано до 50 записей)")
+        blocks.append("\n".join(block_lines))
+    await m.reply("\n\n".join(blocks), disable_web_page_preview=True)
+
 
 @router.message(Command("ach_reset"))
 async def cmd_ach_reset(m: Message, command: CommandObject):
@@ -858,6 +1010,8 @@ async def cmd_ach_top(m: Message):
     if not rows:
         return await m.reply("Пока никто не получил ачивок.")
     lines = ["<b>Топ по ачивкам</b>:"]
+    profiles = _fetch_user_profiles({uid for uid, _ in rows})
     for i, (uid, cnt) in enumerate(rows, start=1):
-        lines.append(f"{i}. user_id={uid} — {cnt}")
+        mention = _format_user_mention(uid, profiles)
+        lines.append(f"{i}. {mention} — {cnt}")
     await m.reply("\n".join(lines))
