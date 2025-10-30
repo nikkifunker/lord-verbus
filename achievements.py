@@ -673,8 +673,11 @@ async def cmd_ach_del(m: Message, command: CommandObject):
     ach = _find_achievement_by_code_or_id(arg)
     if not ach:
         return await m.reply("Не найдено.")
-    _exec("DELETE FROM achievements WHERE id=?;", (ach[0],))
-    await m.reply("Удалено.")
+    deleted = delete_achievement_globally(ach[1])
+    await m.reply(
+        "Удалено." if deleted else "Не найдено данных."
+        + (f" Очищено записей: {deleted}." if deleted else "")
+    )
 
 @router.message(Command("ach_list"))
 async def cmd_ach_list(m: Message):
