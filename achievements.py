@@ -7,9 +7,10 @@ from datetime import datetime, timezone
 from html import escape
 from typing import Any
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
+from aiogram.enums import ContentType
 
 from utils.achievements_format import format_achievement_message
 from utils.sender import send_achievement_award
@@ -21,6 +22,22 @@ DB = os.getenv("DB_PATH", "bot.sqlite3")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "320872593").replace(" ", "").split(",") if x}
 
 router = Router(name="achievements")
+
+METRIC_ALIASES = {
+    "voice": "voice",
+    "voices": "voice",
+    "videonote": "videonote",
+    "video_note": "videonote",
+    "circles": "videonote",
+    "sticker": "sticker",
+    "stickers": "sticker",
+}
+
+SUPPORTED_METRICS = {"messages", "voice", "videonote", "sticker"}
+
+
+def _canonical_metric(metric: str) -> str:
+    return METRIC_ALIASES.get(metric.lower(), metric.lower())
 
 # =========
 # DB utils
@@ -167,6 +184,45 @@ def _increment_progress(chat_id: int, user_id: int, ach_id: int, delta: int) -> 
         )
         conn.commit()
         return _get_progress_value_conn(conn, chat_id, user_id, ach_id)
+
+
+def _get_user_metric_value(chat_id: int, user_id: int, metric: str) -> int:
+    with closing(_conn()) as conn:
+        cur = conn.execute(
+            "SELECT count FROM user_metrics WHERE chat_id=? AND user_id=? AND metric=?;",
+            (chat_id, user_id, metric),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+
+async def get_user_metric(chat_id: int, user_id: int, metric: str) -> int:
+    return _get_user_metric_value(chat_id, user_id, metric)
+
+
+async def inc_user_metric(chat_id: int, user_id: int, metric: str, delta: int = 1) -> int:
+    if delta <= 0:
+        return await get_user_metric(chat_id, user_id, metric)
+    now = _now_ts()
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO user_metrics(chat_id, user_id, metric, count, updated_at)
+            VALUES(?,?,?,?,?);
+            """,
+            (chat_id, user_id, metric, 0, now),
+        )
+        conn.execute(
+            """
+            UPDATE user_metrics
+            SET count = count + ?, updated_at=?
+            WHERE chat_id=? AND user_id=? AND metric=?;
+            """,
+            (delta, now, chat_id, user_id, metric),
+        )
+        conn.commit()
+    return _get_user_metric_value(chat_id, user_id, metric)
 
 
 def _fetch_user_profiles(user_ids: set[int]) -> dict[int, tuple[str | None, str | None]]:
@@ -355,7 +411,8 @@ def _rebuild_achievements_if_needed():
                     title TEXT NOT NULL,
                     description TEXT NOT NULL,
                     kind TEXT NOT NULL CHECK(kind IN ('single','tiered')),
-                    condition_type TEXT NOT NULL CHECK(condition_type IN ('messages','date','keyword')),
+                    condition_type TEXT NOT NULL CHECK(condition_type IN ('messages','date','keyword','voice','videonote','sticker')),
+                    metric TEXT NOT NULL,
                     thresholds TEXT,
                     target_ts INTEGER,
                     active INTEGER NOT NULL DEFAULT 1,
@@ -370,6 +427,7 @@ def _rebuild_achievements_if_needed():
                 "desc":     "description" if "description" in cols else "''",
                 "kind":     "kind" if "kind" in cols else "'single'",
                 "ctype":    "condition_type" if "condition_type" in cols else "'messages'",
+                "metric":   "metric" if "metric" in cols else "condition_type",
                 "thr":      "thresholds" if "thresholds" in cols else "NULL",
                 "ts":       "target_ts" if "target_ts" in cols else "NULL",
                 "active":   "active" if "active" in cols else "1",
@@ -378,9 +436,9 @@ def _rebuild_achievements_if_needed():
             if cols:
                 c.execute(f"""
                     INSERT OR IGNORE INTO achievements_new
-                    (id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json)
+                    (id, code, title, description, kind, condition_type, metric, thresholds, target_ts, active, extra_json)
                     SELECT {sel['id']}, {sel['code']}, {sel['title']}, {sel['desc']},
-                           {sel['kind']}, {sel['ctype']}, {sel['thr']}, {sel['ts']}, {sel['active']}, {sel['extra']}
+                           {sel['kind']}, {sel['ctype']}, {sel['metric']}, {sel['thr']}, {sel['ts']}, {sel['active']}, {sel['extra']}
                     FROM achievements;
                 """)
                 c.execute("DROP TABLE achievements;")
@@ -391,6 +449,7 @@ def _rebuild_achievements_if_needed():
             need = {
                 "condition_type": "ALTER TABLE achievements ADD COLUMN condition_type TEXT",
                 "thresholds":     "ALTER TABLE achievements ADD COLUMN thresholds TEXT",
+                "metric":         "ALTER TABLE achievements ADD COLUMN metric TEXT",
                 "target_ts":      "ALTER TABLE achievements ADD COLUMN target_ts INTEGER",
                 "active":         "ALTER TABLE achievements ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
                 "extra_json":     "ALTER TABLE achievements ADD COLUMN extra_json TEXT",
@@ -399,6 +458,11 @@ def _rebuild_achievements_if_needed():
                 if col not in cols:
                     try: c.execute(ddl + ";")
                     except sqlite3.OperationalError: pass
+            if "metric" not in cols:
+                try:
+                    c.execute("UPDATE achievements SET metric=condition_type WHERE metric IS NULL;")
+                except sqlite3.OperationalError:
+                    pass
             c.commit()
 
 def _rebuild_user_stats_if_needed():
@@ -520,6 +584,50 @@ def _rebuild_achievement_progress_if_needed():
             c.commit()
 
 
+def _rebuild_user_metrics_if_needed():
+    cols = _table_cols("user_metrics")
+    required = {"chat_id", "user_id", "metric", "count", "updated_at"}
+    need_rebuild = not cols or not required.issubset(set(cols))
+    with closing(_conn()) as c:
+        if need_rebuild:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_metrics_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    metric TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                    UNIQUE(chat_id, user_id, metric)
+                );
+                """
+            )
+            if cols:
+                try:
+                    c.execute(
+                        """
+                        INSERT OR IGNORE INTO user_metrics_new (chat_id, user_id, metric, count, updated_at)
+                        SELECT
+                            COALESCE(chat_id, 0),
+                            COALESCE(user_id, 0),
+                            metric,
+                            COALESCE(count, 0),
+                            COALESCE(updated_at, strftime('%s','now'))
+                        FROM user_metrics;
+                        """
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                c.execute("DROP TABLE user_metrics;")
+            c.execute("ALTER TABLE user_metrics_new RENAME TO user_metrics;")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_user_metrics_metric ON user_metrics(metric);")
+            c.commit()
+        elif cols:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_user_metrics_metric ON user_metrics(metric);")
+            c.commit()
+
+
 def init_db():
     # базовое создание (если первый запуск)
     with closing(_conn()) as c:
@@ -532,7 +640,8 @@ def init_db():
             title TEXT NOT NULL,
             description TEXT NOT NULL,
             kind TEXT NOT NULL CHECK(kind IN ('single','tiered')),
-            condition_type TEXT NOT NULL CHECK(condition_type IN ('messages','date','keyword')),
+            condition_type TEXT NOT NULL CHECK(condition_type IN ('messages','date','keyword','voice','videonote','sticker')),
+            metric TEXT NOT NULL,
             thresholds TEXT,
             target_ts INTEGER,
             active INTEGER NOT NULL DEFAULT 1,
@@ -569,12 +678,25 @@ def init_db():
             FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
         );
         """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS user_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            metric TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            UNIQUE(chat_id, user_id, metric)
+        );
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_user_metrics_metric ON user_metrics(metric);")
         c.commit()
     # миграции для любых старых схем
     _rebuild_achievements_if_needed()
     _rebuild_user_stats_if_needed()
     _rebuild_user_achievements_if_needed()
     _rebuild_achievement_progress_if_needed()
+    _rebuild_user_metrics_if_needed()
 
 # =========
 # Helpers
@@ -664,6 +786,81 @@ def _unlock(chat_id: int, user_id: int, ach_id: int, tier: int):
         (chat_id, user_id, ach_id, tier, _now_ts())
     )
 
+
+async def ach_engine_on_metric(
+    metric: str,
+    chat_id: int,
+    user_id: int,
+    new_value: int,
+    *,
+    message: Message | None = None,
+):
+    canonical_metric = _canonical_metric(metric)
+    if canonical_metric not in SUPPORTED_METRICS:
+        return
+    if new_value is None or new_value < 0:
+        return
+    rows = _q(
+        """
+        SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, metric, thresholds, extra_json
+        FROM achievements
+        WHERE active=1 AND metric=?;
+        """,
+        (canonical_metric,),
+    )
+    if not rows:
+        return
+    for (aid, code, title, desc, kind, ctype, stored_metric, thresholds_json, extra_json) in rows:
+        thresholds = []
+        if thresholds_json:
+            try:
+                thresholds = sorted({int(v) for v in json.loads(thresholds_json)})
+            except Exception:
+                thresholds = []
+        if not thresholds:
+            continue
+        prev_progress = _get_progress_value(chat_id, user_id, aid)
+        delta = int(new_value) - prev_progress
+        total = prev_progress
+        if delta > 0:
+            total = _increment_progress(chat_id, user_id, aid, delta)
+        curr_tier = _user_max_tier(chat_id, user_id, aid)
+        if kind == "tiered":
+            target_tier = curr_tier
+            for idx, threshold in enumerate(thresholds, start=1):
+                if total >= threshold:
+                    target_tier = idx
+                else:
+                    break
+            if target_tier > curr_tier:
+                for tier in range(curr_tier + 1, target_tier + 1):
+                    if _user_has_tier(chat_id, user_id, aid, tier):
+                        continue
+                    _unlock(chat_id, user_id, aid, tier)
+                    if message:
+                        rarity = _calc_rarity(chat_id, aid)
+                        await _announce(
+                            message,
+                            code,
+                            title,
+                            desc,
+                            rarity,
+                            level=tier,
+                        )
+        else:
+            threshold = thresholds[0]
+            if total >= threshold and not _user_has_tier(chat_id, user_id, aid, 1):
+                _unlock(chat_id, user_id, aid, 1)
+                if message:
+                    await _announce(
+                        message,
+                        code,
+                        title,
+                        desc,
+                        _calc_rarity(chat_id, aid),
+                    )
+
+
 # =========
 # Публичный хук (вызывать после логирования сообщения)
 # =========
@@ -673,7 +870,7 @@ async def on_text_hook(m: Message):
     Инкремент счётчиков и проверка триггеров.
     ВАЖНО: выдаётся только ОДИН следующий уровень за одно сообщение.
     """
-    if not m.from_user:
+    if not m.from_user or m.from_user.is_bot:
         return
     chat_id = m.chat.id
     user_id = m.from_user.id
@@ -681,19 +878,25 @@ async def on_text_hook(m: Message):
     # 1) счётчик сообщений
     _exec("INSERT OR IGNORE INTO user_stats(chat_id, user_id) VALUES(?, ?);", (chat_id, user_id))
     _exec("UPDATE user_stats SET messages_count=messages_count+1 WHERE chat_id=? AND user_id=?;", (chat_id, user_id))
+    total_messages_row = _q(
+        "SELECT messages_count FROM user_stats WHERE chat_id=? AND user_id=? LIMIT 1;",
+        (chat_id, user_id),
+    )
+    total_messages = int(total_messages_row[0][0]) if total_messages_row else 0
+    await ach_engine_on_metric("messages", chat_id, user_id, total_messages, message=m)
 
     # 2) активные ачивки
     achs = _q("""
-        SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
+        SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, metric, thresholds, target_ts, active, extra_json
         FROM achievements
-        WHERE active=1;
+        WHERE active=1 AND condition_type IN ('date','keyword');
     """)
     if not achs:
         return
 
     text = (m.text or m.caption or "")
 
-    for (aid, code, title, desc, kind, ctype, thresholds_json, target_ts, active, extra_json) in achs:
+    for (aid, code, title, desc, kind, ctype, metric, thresholds_json, target_ts, active, extra_json) in achs:
         # thresholds
         try:
             thresholds = sorted(set(map(int, json.loads(thresholds_json)))) if thresholds_json else []
@@ -704,24 +907,8 @@ async def on_text_hook(m: Message):
         curr_tier = _user_max_tier(chat_id, user_id, aid)
 
         # messages
-        if ctype == "messages":
-            total = _increment_progress(chat_id, user_id, aid, 1)
-            next_tier = _next_tier_to_award(thresholds, total, curr_tier) if kind == "tiered" else (1 if thresholds and total >= thresholds[0] and curr_tier == 0 else None)
-            if next_tier:
-                _unlock(chat_id, user_id, aid, next_tier)
-                rarity = _calc_rarity(chat_id, aid)
-                level = next_tier if kind == "tiered" else None
-                await _announce(
-                    m,
-                    code,
-                    title,
-                    desc,
-                    rarity,
-                    level=level,
-                )
-
         # date (разовая)
-        elif ctype == "date" and target_ts:
+        if ctype == "date" and target_ts:
             if curr_tier == 0 and _now_ts() >= int(target_ts):
                 _unlock(chat_id, user_id, aid, 1)
                 await _announce(
@@ -764,12 +951,36 @@ async def on_text_hook(m: Message):
                     level=level,
                 )
 
+
+@router.message(F.content_type == ContentType.VOICE)
+async def on_voice(m: Message):
+    if not m.from_user or m.from_user.is_bot:
+        return
+    new_val = await inc_user_metric(m.chat.id, m.from_user.id, "voice", 1)
+    await ach_engine_on_metric("voice", m.chat.id, m.from_user.id, new_val, message=m)
+
+
+@router.message(F.content_type == ContentType.VIDEO_NOTE)
+async def on_videonote(m: Message):
+    if not m.from_user or m.from_user.is_bot:
+        return
+    new_val = await inc_user_metric(m.chat.id, m.from_user.id, "videonote", 1)
+    await ach_engine_on_metric("videonote", m.chat.id, m.from_user.id, new_val, message=m)
+
+
+@router.message(F.content_type == ContentType.STICKER)
+async def on_sticker(m: Message):
+    if not m.from_user or m.from_user.is_bot:
+        return
+    new_val = await inc_user_metric(m.chat.id, m.from_user.id, "sticker", 1)
+    await ach_engine_on_metric("sticker", m.chat.id, m.from_user.id, new_val, message=m)
+
 # =========
 # Поиск ачивки
 # =========
 def _find_achievement_by_code_or_id(code_or_id: str) -> tuple | None:
     sql = """
-        SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, thresholds, target_ts, active, extra_json
+        SELECT COALESCE(id,rowid) AS id, code, title, description, kind, condition_type, metric, thresholds, target_ts, active, extra_json
         FROM achievements
         WHERE {where}
         LIMIT 1;
@@ -790,6 +1001,10 @@ async def cmd_ach_add(m: Message, command: CommandObject):
     2) /ach_add code|title|description|single|messages|100
     3) /ach_add code|title|description|single|date|YYYY-MM-DD
     4) /ach_add code|title|description|tiered|keyword:WORD|1,3,5
+    5) /ach_add code|title|description|tiered|voice|10,50,100
+    6) /ach_add code|title|description|single|voice|25
+    7) /ach_add code|title|description|tiered|videonote|5,20,50
+    8) /ach_add code|title|description|tiered|sticker|50,200,500
     """
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
@@ -800,26 +1015,48 @@ async def cmd_ach_add(m: Message, command: CommandObject):
             "1) /ach_add code|title|description|tiered|messages|100,1000\n"
             "2) /ach_add code|title|description|single|messages|100\n"
             "3) /ach_add code|title|description|single|date|YYYY-MM-DD\n"
-            "4) /ach_add code|title|description|tiered|keyword:WORD|1,3,5"
+            "4) /ach_add code|title|description|tiered|keyword:WORD|1,3,5\n"
+            "5) /ach_add code|title|description|tiered|voice|10,50,100\n"
+            "6) /ach_add code|title|description|single|voice|25\n"
+            "7) /ach_add code|title|description|tiered|videonote|5,20,50\n"
+            "8) /ach_add code|title|description|tiered|sticker|50,200,500"
         )
     code, title, desc, kind, cond, data = [a.strip() for a in args]
     if kind not in ("single", "tiered"):
         return await m.reply("kind: single|tiered")
-    cond_type = cond
+    cond_lower = cond.lower()
+    cond_type = cond_lower
+    metric_value: str | None = None
     keyword = None
-    if cond.startswith("keyword:"):
+    if cond_lower.startswith("keyword:"):
         cond_type = "keyword"
         keyword = cond.split(":", 1)[1].strip()
         if not keyword:
             return await m.reply("Укажите слово после keyword:, напр. keyword:testtest")
-    if cond_type not in ("messages", "date", "keyword"):
-        return await m.reply("condition: messages | date | keyword:<word>")
+        metric_value = "keyword"
+    elif cond_lower in ("messages",):
+        cond_type = "messages"
+        metric_value = "messages"
+    elif cond_lower == "date":
+        cond_type = "date"
+        metric_value = "date"
+    elif cond_lower in METRIC_ALIASES:
+        canonical = _canonical_metric(cond_lower)
+        cond_type = canonical
+        metric_value = canonical
+    else:
+        return await m.reply(
+            "condition: messages | date | keyword:<word> | voice | videonote | sticker"
+        )
+
+    if metric_value is None:
+        metric_value = cond_type
 
     thresholds_json = None
     target_ts = None
     extra_json = None
     try:
-        if cond_type == "messages":
+        if cond_type in {"messages", "voice", "videonote", "sticker"}:
             thresholds = _parse_thresholds(data)
             if kind == "single" and len(thresholds) != 1:
                 return await m.reply("Для single укажите ровно один порог.")
@@ -838,10 +1075,13 @@ async def cmd_ach_add(m: Message, command: CommandObject):
         return await m.reply(f"Ошибка параметров: {e}")
 
     try:
-        _exec("""
-            INSERT INTO achievements(code,title,description,kind,condition_type,thresholds,target_ts,active,extra_json)
-            VALUES(?,?,?,?,?,?,?,?,?);
-        """, (code, title, desc, kind, cond_type, thresholds_json, target_ts, 1, extra_json))
+        _exec(
+            """
+            INSERT INTO achievements(code,title,description,kind,condition_type,metric,thresholds,target_ts,active,extra_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?);
+            """,
+            (code, title, desc, kind, cond_type, metric_value, thresholds_json, target_ts, 1, extra_json),
+        )
         await m.reply(f"✅ Ачивка добавлена: <b>{title}</b> (code: <code>{code}</code>)")
     except sqlite3.IntegrityError:
         await m.reply("Ачивка с таким code уже существует.")
@@ -894,16 +1134,17 @@ async def cmd_ach_list(m: Message):
     if not m.from_user or not is_admin(m.from_user.id):
         return await m.reply("Недостаточно прав.")
     rows = _q("""
-        SELECT COALESCE(id,rowid) AS id, code, title, kind, condition_type, thresholds, target_ts, active, extra_json
+        SELECT COALESCE(id,rowid) AS id, code, title, kind, condition_type, metric, thresholds, target_ts, active, extra_json
         FROM achievements
         ORDER BY id;
     """)
     if not rows:
         return await m.reply("Список пуст.")
     parts = []
-    for rid, code, title, kind, ctype, thr, ts, active, extra_json in rows:
+    for rid, code, title, kind, ctype, metric, thr, ts, active, extra_json in rows:
         data = []
-        if ctype == "messages":
+        if metric in {"messages", "voice", "videonote", "sticker"}:
+            data.append(f"metric={metric}")
             data.append(f"thresholds={thr}")
         elif ctype == "date":
             data.append(f"date_ts={ts}")
@@ -913,7 +1154,9 @@ async def cmd_ach_list(m: Message):
             except Exception:
                 kw = None
             data.append(f"keyword={kw}; thresholds={thr}")
-        parts.append(f"#{rid} <b>{title}</b> (<code>{code}</code>) — {kind}/{ctype}, {'; '.join(data)}, active={active}")
+        parts.append(
+            f"#{rid} <b>{title}</b> (<code>{code}</code>) — {kind}/{ctype}, {'; '.join(data)}, active={active}"
+        )
     await m.reply("\n".join(parts), disable_web_page_preview=True)
 
 @router.message(Command("ach_edit"))
@@ -962,15 +1205,15 @@ async def cmd_ach_progress(m: Message, command: CommandObject):
     ach = _find_achievement_by_code_or_id(code)
     if not ach:
         return await m.reply("Ачивка не найдена.")
-    aid, _, title, _, kind, ctype, thr_json, target_ts, active, extra_json = ach
+    aid, _, title, _, kind, ctype, metric, thr_json, target_ts, active, extra_json = ach
     try:
         thresholds = sorted(set(map(int, json.loads(thr_json)))) if thr_json else []
     except Exception:
         thresholds = []
 
-    lines = [f"<b>Прогресс по</b> «{title}»:"]
+    lines = [f"<b>Прогресс по</b> «{title}» (metric: <code>{metric}</code>):"]
 
-    if ctype == "messages":
+    if metric in {"messages", "voice", "videonote", "sticker"}:
         rows = _q(
             """
             SELECT user_id, progress
@@ -1038,7 +1281,7 @@ async def cmd_ach_globalview(m: Message):
         return await m.reply("Недостаточно прав.")
     achs = _q(
         """
-        SELECT COALESCE(id,rowid) AS id, code, title, kind, condition_type
+        SELECT COALESCE(id,rowid) AS id, code, title, kind, condition_type, metric
         FROM achievements
         ORDER BY id;
         """
@@ -1046,10 +1289,10 @@ async def cmd_ach_globalview(m: Message):
     if not achs:
         return await m.reply("Ачивок нет в базе.")
     blocks: list[str] = []
-    for aid, code, title, kind, ctype in achs:
+    for aid, code, title, kind, ctype, metric in achs:
         block_lines = [
             f"<b>#{aid}</b> — <b>{escape(title)}</b> (<code>{escape(code)}</code>)",
-            f"Тип: {kind}/{ctype}",
+            f"Тип: {kind}/{ctype}, metric: {metric}",
         ]
         progress_rows = _q(
             """
