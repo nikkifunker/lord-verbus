@@ -10,7 +10,7 @@ import re as _re
 import os, pathlib
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.types import Message, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 from aiogram.enums import ParseMode
@@ -33,6 +33,7 @@ print(f"[DB] Using SQLite at: {os.path.abspath(DB)}")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+main_router = Router(name="main")
 
 # ID наблюдаемого пользователя (кружки отслеживаем у него)
 WATCH_USER_ID = 447968194   # @daria_mango
@@ -328,7 +329,7 @@ def prev_summary_link(chat_id: int) -> str | None:
     if not row: return None
     return tg_link(chat_id, row[0][0])
 
-@dp.message(Command("lord_summary"))
+@main_router.message(Command("lord_summary"))
 async def cmd_summary(m: Message, command: CommandObject):
     try:
         n = int((command.args or "").strip())
@@ -415,7 +416,7 @@ async def cmd_summary(m: Message, command: CommandObject):
 # =========================
 # Психологический портрет (простой: 3 абзаца, без ссылок и <br>)
 # =========================
-@dp.message(Command("lord_psych"))
+@main_router.message(Command("lord_psych"))
 async def cmd_lord_psych(m: Message, command: CommandObject):
     """
     Использование:
@@ -608,7 +609,7 @@ async def maybe_interject(m: Message):
 # =========================
 # Handlers
 # =========================
-@dp.message(CommandStart())
+@main_router.message(CommandStart())
 async def start(m: Message):
     await m.reply(
         "Я — Лорд Вербус. Команды:\n"
@@ -617,7 +618,7 @@ async def start(m: Message):
         "Просто говорите — я вмешаюсь, если нужно."
     )
 
-@dp.message(F.text)
+@main_router.message(F.text)
 async def on_text(m: Message):
     if not m.text:
         return
@@ -676,7 +677,7 @@ def _message_link(chat, message_id: int) -> str | None:
         return f"https://t.me/c/{cid[4:]}/{message_id}"
     return None
 
-@dp.message(F.video_note)
+@main_router.message(F.video_note)
 async def on_video_note_watch(m: Message):
     """
     Если @daria_mango (WATCH_USER_ID) отправляет видеокружок,
@@ -723,7 +724,7 @@ async def set_commands():
     await bot.set_my_commands(commands_group, scope=BotCommandScopeAllGroupChats())
     await bot.set_my_commands(commands_private, scope=BotCommandScopeAllPrivateChats())
 
-@dp.message(Command("debug_ach"))
+@main_router.message(Command("debug_ach"))
 async def debug_achievements(m: Message):
     """Диагностика системы достижений"""
     if not m.from_user:
@@ -782,7 +783,9 @@ async def main():
     # Регистрируем роутер ачивок
     print("[INIT] Registering achievements router...")
     dp.include_router(ach_router)
-    print("[INIT] Achievements ready!")
+    print("[INIT] Registering main router...")
+    dp.include_router(main_router)
+    print("[INIT] Routers ready!")
     
     await set_commands()
     print("[START] Bot is polling...")
