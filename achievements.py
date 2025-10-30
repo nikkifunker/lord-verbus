@@ -4,6 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
+from html import escape
 from typing import Any
 
 from aiogram import Router
@@ -54,6 +55,292 @@ def _table_cols(name: str) -> list[str]:
     with closing(_conn()) as c:
         cur = c.execute(f"PRAGMA table_info({name});")
         return [r[1] for r in cur.fetchall()]  # name = index 1
+
+
+def _table_exists_conn(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", (name,))
+    return cur.fetchone() is not None
+
+
+def _table_cols_conn(conn: sqlite3.Connection, name: str) -> set[str]:
+    if not _table_exists_conn(conn, name):
+        return set()
+    cur = conn.execute(f"PRAGMA table_info({name});")
+    return {row[1] for row in cur.fetchall()}
+
+
+def _delete_optional_records(
+    conn: sqlite3.Connection,
+    table: str,
+    column_values: dict[str, Any],
+) -> int:
+    columns = _table_cols_conn(conn, table)
+    if not columns:
+        return 0
+    filtered = [(col, val) for col, val in column_values.items() if val is not None and col in columns]
+    if not filtered:
+        return 0
+    where = " AND ".join(f"{col}=?" for col, _ in filtered)
+    cur = conn.execute(f"DELETE FROM {table} WHERE {where};", tuple(val for _, val in filtered))
+    return cur.rowcount
+
+
+def _remove_progress_records(
+    conn: sqlite3.Connection,
+    *,
+    ach_code: str,
+    ach_id: int,
+    chat_id: int | None,
+    user_id: int | None,
+) -> int:
+    targets = (
+        "achievements_progress",
+        "achievement_progress",
+        "achievements_states",
+        "achievement_states",
+        "achievements_awards",
+    )
+    total = 0
+    for table in targets:
+        total += _delete_optional_records(
+            conn,
+            table,
+            {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "achievement_id": ach_id,
+                "ach_id": ach_id,
+                "achievement_code": ach_code,
+                "ach_code": ach_code,
+                "code": ach_code,
+            },
+        )
+    return total
+
+
+def _truncate_table(conn: sqlite3.Connection, table: str) -> int:
+    if not _table_exists_conn(conn, table):
+        return 0
+    cur = conn.execute(f"DELETE FROM {table};")
+    return cur.rowcount
+
+
+def _get_progress_value_conn(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    user_id: int,
+    ach_id: int,
+) -> int:
+    cur = conn.execute(
+        "SELECT progress FROM achievement_progress WHERE chat_id=? AND user_id=? AND achievement_id=?;",
+        (chat_id, user_id, ach_id),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _get_progress_value(chat_id: int, user_id: int, ach_id: int) -> int:
+    with closing(_conn()) as conn:
+        return _get_progress_value_conn(conn, chat_id, user_id, ach_id)
+
+
+def _increment_progress(chat_id: int, user_id: int, ach_id: int, delta: int) -> int:
+    if delta <= 0:
+        return _get_progress_value(chat_id, user_id, ach_id)
+    now = _now_ts()
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO achievement_progress(chat_id, user_id, achievement_id, progress, updated_at)
+            VALUES(?,?,?,?,?);
+            """,
+            (chat_id, user_id, ach_id, 0, now),
+        )
+        conn.execute(
+            """
+            UPDATE achievement_progress
+            SET progress = progress + ?, updated_at=?
+            WHERE chat_id=? AND user_id=? AND achievement_id=?;
+            """,
+            (delta, now, chat_id, user_id, ach_id),
+        )
+        conn.commit()
+        return _get_progress_value_conn(conn, chat_id, user_id, ach_id)
+
+
+def _fetch_user_profiles(user_ids: set[int]) -> dict[int, tuple[str | None, str | None]]:
+    if not user_ids or not _table_exists("users"):
+        return {}
+    cols = set(_table_cols("users"))
+    if "user_id" not in cols:
+        return {}
+    placeholders = ",".join("?" for _ in user_ids)
+    sel_display = "display_name" if "display_name" in cols else "username" if "username" in cols else "NULL"
+    sel_username = "username" if "username" in cols else "NULL"
+    rows = _q(
+        f"SELECT user_id, {sel_display}, {sel_username} FROM users WHERE user_id IN ({placeholders});",
+        tuple(user_ids),
+    )
+    return {int(uid): (display_name, username) for uid, display_name, username in rows}
+
+
+def _format_user_mention(user_id: int, profiles: dict[int, tuple[str | None, str | None]] | None = None) -> str:
+    display = None
+    username = None
+    if profiles and user_id in profiles:
+        display, username = profiles[user_id]
+    elif _table_exists("users"):
+        cols = set(_table_cols("users"))
+        if "user_id" in cols:
+            sel_display = "display_name" if "display_name" in cols else "username" if "username" in cols else "NULL"
+            sel_username = "username" if "username" in cols else "NULL"
+            order = " ORDER BY updated_at DESC" if "updated_at" in cols else ""
+            rows = _q(
+                f"SELECT {sel_display}, {sel_username} FROM users WHERE user_id=?{order} LIMIT 1;",
+                (user_id,),
+            )
+        else:
+            rows = []
+        if rows:
+            display, username = rows[0]
+    name = (display or username or str(user_id)).strip() or str(user_id)
+    return f'<a href="tg://user?id={user_id}">{escape(name)}</a>'
+
+
+def delete_user_achievement(chat_id: int, user_id: int, ach_code: str) -> int:
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN")
+        try:
+            ach_row = conn.execute(
+                "SELECT COALESCE(id,rowid) FROM achievements WHERE LOWER(code)=LOWER(?) LIMIT 1;",
+                (ach_code,),
+            ).fetchone()
+            if not ach_row:
+                conn.rollback()
+                return 0
+            ach_id = int(ach_row[0])
+            total = 0
+            total += _delete_optional_records(
+                conn,
+                "user_achievements",
+                {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "achievement_id": ach_id,
+                    "ach_id": ach_id,
+                    "achievement_code": ach_code,
+                    "ach_code": ach_code,
+                    "code": ach_code,
+                },
+            )
+            total += _remove_progress_records(
+                conn,
+                ach_code=ach_code,
+                ach_id=ach_id,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+            conn.commit()
+            return total
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def global_reset_achievements() -> dict[str, int]:
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN")
+        try:
+            stats: dict[str, int] = {}
+            stats["user_achievements"] = _truncate_table(conn, "user_achievements")
+            stats["achievement_progress"] = _truncate_table(conn, "achievement_progress")
+            for table in (
+                "achievements_progress",
+                "achievements_states",
+                "achievement_states",
+                "achievements_awards",
+            ):
+                stats[table] = _truncate_table(conn, table)
+            stats["achievements"] = _truncate_table(conn, "achievements")
+            conn.commit()
+            return stats
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def reset_user_achievement_progress(chat_id: int, user_id: int, ach_code: str) -> int:
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN")
+        try:
+            ach_row = conn.execute(
+                "SELECT COALESCE(id,rowid) FROM achievements WHERE LOWER(code)=LOWER(?) LIMIT 1;",
+                (ach_code,),
+            ).fetchone()
+            if not ach_row:
+                conn.rollback()
+                return 0
+            ach_id = int(ach_row[0])
+            removed = _remove_progress_records(
+                conn,
+                ach_code=ach_code,
+                ach_id=ach_id,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+            conn.commit()
+            return removed
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def delete_achievement_globally(ach_code: str) -> int:
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN")
+        try:
+            ach_row = conn.execute(
+                "SELECT COALESCE(id,rowid) FROM achievements WHERE LOWER(code)=LOWER(?) LIMIT 1;",
+                (ach_code,),
+            ).fetchone()
+            if not ach_row:
+                conn.rollback()
+                return 0
+            ach_id = int(ach_row[0])
+            total = 0
+            total += _delete_optional_records(
+                conn,
+                "user_achievements",
+                {
+                    "achievement_id": ach_id,
+                    "ach_id": ach_id,
+                    "achievement_code": ach_code,
+                    "ach_code": ach_code,
+                    "code": ach_code,
+                },
+            )
+            total += _remove_progress_records(
+                conn,
+                ach_code=ach_code,
+                ach_id=ach_id,
+                chat_id=None,
+                user_id=None,
+            )
+            total += _delete_optional_records(
+                conn,
+                "achievements",
+                {"id": ach_id, "code": ach_code},
+            )
+            conn.commit()
+            return total
+        except Exception:
+            conn.rollback()
+            raise
 
 def _rebuild_achievements_if_needed():
     cols = _table_cols("achievements")
@@ -180,6 +467,59 @@ def _rebuild_user_achievements_if_needed():
             c.execute("ALTER TABLE user_achievements_new RENAME TO user_achievements;")
             c.commit()
 
+
+def _rebuild_achievement_progress_if_needed():
+    cols = _table_cols("achievement_progress")
+    need_rebuild = not cols or any(
+        c not in cols for c in ("chat_id", "user_id", "achievement_id", "progress", "updated_at")
+    )
+    with closing(_conn()) as c:
+        if need_rebuild:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS achievement_progress_new (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    achievement_id INTEGER NOT NULL,
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, user_id, achievement_id),
+                    FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
+                );
+                """
+            )
+            if cols:
+                available = set(cols)
+                try:
+                    select_cols = []
+                    for col in ("chat_id", "user_id", "achievement_id", "progress", "updated_at"):
+                        if col in available:
+                            select_cols.append(col)
+                        elif col == "updated_at":
+                            select_cols.append("strftime('%s','now')")
+                        else:
+                            select_cols.append("0")
+                    c.execute(
+                        """
+                        INSERT OR IGNORE INTO achievement_progress_new
+                        (chat_id, user_id, achievement_id, progress, updated_at)
+                        SELECT {chat_id}, {user_id}, {achievement_id}, {progress}, {updated_at}
+                        FROM achievement_progress;
+                        """.format(
+                            chat_id=select_cols[0],
+                            user_id=select_cols[1],
+                            achievement_id=select_cols[2],
+                            progress=select_cols[3],
+                            updated_at=select_cols[4],
+                        )
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                c.execute("DROP TABLE achievement_progress;")
+            c.execute("ALTER TABLE achievement_progress_new RENAME TO achievement_progress;")
+            c.commit()
+
+
 def init_db():
     # базовое создание (если первый запуск)
     with closing(_conn()) as c:
@@ -218,11 +558,23 @@ def init_db():
             FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
         );
         """)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS achievement_progress (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            achievement_id INTEGER NOT NULL,
+            progress INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(chat_id, user_id, achievement_id),
+            FOREIGN KEY(achievement_id) REFERENCES achievements(id) ON DELETE CASCADE
+        );
+        """)
         c.commit()
     # миграции для любых старых схем
     _rebuild_achievements_if_needed()
     _rebuild_user_stats_if_needed()
     _rebuild_user_achievements_if_needed()
+    _rebuild_achievement_progress_if_needed()
 
 # =========
 # Helpers
@@ -264,18 +616,15 @@ async def _announce(
     description: str,
     rarity: float,
     level: int | None = None,
-    progress: tuple[int, int] | None = None,
 ):
     if not m.from_user:
         return
     text = format_achievement_message(
         user_id=m.from_user.id,
         user_name=m.from_user.full_name,
-        ach_code=code,
         ach_title=title,
         level=level,
         description=description,
-        progress=progress,
     )
     text = f"{text}\n<i>Редкость:</i> <b>{rarity}%</b>"
     await send_achievement_award(m.bot, m.chat.id, text)
@@ -342,8 +691,6 @@ async def on_text_hook(m: Message):
     if not achs:
         return
 
-    # текущий счетчик сообщений пользователя
-    msg_cnt = _q("SELECT messages_count FROM user_stats WHERE chat_id=? AND user_id=?;", (chat_id, user_id))[0][0]
     text = (m.text or m.caption or "")
 
     for (aid, code, title, desc, kind, ctype, thresholds_json, target_ts, active, extra_json) in achs:
@@ -358,17 +705,11 @@ async def on_text_hook(m: Message):
 
         # messages
         if ctype == "messages":
-            total = msg_cnt  # «прогресс» по этой ачивке
+            total = _increment_progress(chat_id, user_id, aid, 1)
             next_tier = _next_tier_to_award(thresholds, total, curr_tier) if kind == "tiered" else (1 if thresholds and total >= thresholds[0] and curr_tier == 0 else None)
             if next_tier:
                 _unlock(chat_id, user_id, aid, next_tier)
                 rarity = _calc_rarity(chat_id, aid)
-                goal = None
-                if thresholds and 0 <= next_tier - 1 < len(thresholds):
-                    goal = thresholds[next_tier - 1]
-                progress = None
-                if goal:
-                    progress = (total, goal)
                 level = next_tier if kind == "tiered" else None
                 await _announce(
                     m,
@@ -377,7 +718,6 @@ async def on_text_hook(m: Message):
                     desc,
                     rarity,
                     level=level,
-                    progress=progress,
                 )
 
         # date (разовая)
@@ -408,24 +748,12 @@ async def on_text_hook(m: Message):
                 continue
 
             # «прогресс» — число сообщений пользователя с ключевым словом
-            try:
-                total = _q("""
-                    SELECT COUNT(*) FROM messages
-                    WHERE chat_id=? AND user_id=? AND LOWER(text) LIKE LOWER(?);
-                """, (chat_id, user_id, f"%{kw}%"))[0][0]
-            except Exception:
-                total = 1  # fallback, если таблицы messages нет/сломана
+            total = _increment_progress(chat_id, user_id, aid, 1)
 
             next_tier = _next_tier_to_award(thresholds, total, curr_tier) if kind == "tiered" else (1 if thresholds and total >= thresholds[0] and curr_tier == 0 else None)
             if next_tier:
                 _unlock(chat_id, user_id, aid, next_tier)
                 rarity = _calc_rarity(chat_id, aid)
-                goal = None
-                if thresholds and 0 <= next_tier - 1 < len(thresholds):
-                    goal = thresholds[next_tier - 1]
-                progress = None
-                if goal:
-                    progress = (total, goal)
                 level = next_tier if kind == "tiered" else None
                 await _announce(
                     m,
@@ -434,7 +762,6 @@ async def on_text_hook(m: Message):
                     desc,
                     rarity,
                     level=level,
-                    progress=progress,
                 )
 
 # =========
@@ -531,8 +858,32 @@ async def cmd_ach_del(m: Message, command: CommandObject):
     ach = _find_achievement_by_code_or_id(arg)
     if not ach:
         return await m.reply("Не найдено.")
-    _exec("DELETE FROM achievements WHERE id=?;", (ach[0],))
-    await m.reply("Удалено.")
+    deleted = delete_achievement_globally(ach[1])
+    await m.reply(
+        "Удалено." if deleted else "Не найдено данных."
+        + (f" Очищено записей: {deleted}." if deleted else "")
+    )
+
+
+@router.message(Command("ach_globalreset"))
+async def cmd_ach_globalreset(m: Message):
+    if not m.from_user or not is_admin(m.from_user.id):
+        return await m.reply("Недостаточно прав.")
+    stats = global_reset_achievements()
+    lines = ["<b>Глобальный сброс выполнен.</b>"]
+    label_map = {
+        "achievements": "achievements",
+        "user_achievements": "user_achievements",
+        "achievement_progress": "achievement_progress",
+        "achievements_progress": "achievements_progress",
+        "achievements_states": "achievements_states",
+        "achievement_states": "achievement_states",
+        "achievements_awards": "achievements_awards",
+    }
+    for key in label_map:
+        if key in stats:
+            lines.append(f"{label_map[key]}: {stats[key]}")
+    await m.reply("\n".join(lines), disable_web_page_preview=True)
 
 @router.message(Command("ach_list"))
 async def cmd_ach_list(m: Message):
@@ -613,39 +964,133 @@ async def cmd_ach_progress(m: Message, command: CommandObject):
     except Exception:
         thresholds = []
 
-    rows = _q("""
-        SELECT s.user_id, s.messages_count
-        FROM user_stats s
-        WHERE s.chat_id=?
-        ORDER BY s.messages_count DESC;
-    """, (m.chat.id,))
-    if not rows:
-        return await m.reply("Пока нет данных по этому чату.")
-
     lines = [f"<b>Прогресс по</b> «{title}»:"]
 
     if ctype == "messages":
-        for uid, msg_cnt in rows[:50]:
-            taken = _q("""
-                SELECT MAX(tier) FROM user_achievements
-                WHERE chat_id=? AND user_id=? AND achievement_id=?;
-            """, (m.chat.id, uid, aid))[0][0] or 0
-            next_thr = None
-            for i, t in enumerate(sorted(thresholds), start=1):
-                if msg_cnt < t:
-                    next_thr = t
-                    break
-            status = f"все уровни ({taken}/{len(thresholds)})" if next_thr is None and thresholds else f"{msg_cnt} / {next_thr or '-'}"
-            lines.append(f"• user_id={uid}: {status}")
+        rows = _q(
+            """
+            SELECT user_id, progress
+            FROM achievement_progress
+            WHERE achievement_id=? AND chat_id=?
+            ORDER BY progress DESC, user_id ASC;
+            """,
+            (aid, m.chat.id),
+        )
+        if not rows:
+            lines.append("Данных по прогрессу пока нет.")
+        else:
+            profiles = _fetch_user_profiles({int(uid) for uid, _ in rows[:50]})
+            for uid, progress_val in rows[:50]:
+                uid = int(uid)
+                taken = _q(
+                    """
+                    SELECT MAX(tier) FROM user_achievements
+                    WHERE chat_id=? AND user_id=? AND achievement_id=?;
+                    """,
+                    (m.chat.id, uid, aid),
+                )[0][0] or 0
+                next_thr = None
+                for idx, threshold in enumerate(sorted(thresholds), start=1):
+                    if progress_val < threshold:
+                        next_thr = threshold
+                        break
+                status = (
+                    f"все уровни ({taken}/{len(thresholds)})"
+                    if next_thr is None and thresholds
+                    else f"{progress_val} / {next_thr or '-'}"
+                )
+                mention = _format_user_mention(uid, profiles)
+                lines.append(f"• {mention}: {status}")
     elif ctype == "keyword":
         try:
             kw = json.loads(extra_json).get("keyword") if extra_json else None
         except Exception:
             kw = None
+        rows = _q(
+            """
+            SELECT user_id, progress
+            FROM achievement_progress
+            WHERE achievement_id=? AND chat_id=?
+            ORDER BY progress DESC, user_id ASC;
+            """,
+            (aid, m.chat.id),
+        )
         lines.append(f"Тип: keyword, слово: <code>{kw}</code>")
+        if rows:
+            profiles = _fetch_user_profiles({int(uid) for uid, _ in rows[:50]})
+            for uid, progress_val in rows[:50]:
+                mention = _format_user_mention(int(uid), profiles)
+                lines.append(f"• {mention}: {progress_val}")
+        else:
+            lines.append("Данных по прогрессу пока нет.")
     else:
         lines.append("Тип: date — выдаётся автоматически после наступления даты при любой активности.")
-    await m.reply("\n".join(lines))
+    await m.reply("\n".join(lines), disable_web_page_preview=True)
+
+
+@router.message(Command("ach_globalview"))
+async def cmd_ach_globalview(m: Message):
+    if not m.from_user or not is_admin(m.from_user.id):
+        return await m.reply("Недостаточно прав.")
+    achs = _q(
+        """
+        SELECT COALESCE(id,rowid) AS id, code, title, kind, condition_type
+        FROM achievements
+        ORDER BY id;
+        """
+    )
+    if not achs:
+        return await m.reply("Ачивок нет в базе.")
+    blocks: list[str] = []
+    for aid, code, title, kind, ctype in achs:
+        block_lines = [
+            f"<b>#{aid}</b> — <b>{escape(title)}</b> (<code>{escape(code)}</code>)",
+            f"Тип: {kind}/{ctype}",
+        ]
+        progress_rows = _q(
+            """
+            SELECT chat_id, user_id, progress
+            FROM achievement_progress
+            WHERE achievement_id=?
+            ORDER BY progress DESC, user_id ASC
+            LIMIT 50;
+            """,
+            (aid,),
+        )
+        awards_rows = _q(
+            """
+            SELECT chat_id, user_id, MAX(tier) AS max_tier
+            FROM user_achievements
+            WHERE achievement_id=?
+            GROUP BY chat_id, user_id;
+            """,
+            (aid,),
+        )
+        progress_map = {(int(chat), int(user)): int(progress) for chat, user, progress in progress_rows}
+        awards_map = {(int(chat), int(user)): int(tier) for chat, user, tier in awards_rows}
+        keys = set(progress_map.keys()) | set(awards_map.keys())
+        if not keys:
+            block_lines.append("  • записей не найдено")
+        else:
+            user_ids = {uid for _, uid in keys}
+            profiles = _fetch_user_profiles(user_ids)
+            for chat_user in sorted(
+                keys,
+                key=lambda cu: (-progress_map.get(cu, 0), cu[0], cu[1]),
+            ):
+                chat_id, user_id = chat_user
+                mention = _format_user_mention(user_id, profiles)
+                progress_val = progress_map.get(chat_user, 0)
+                tier_val = awards_map.get(chat_user)
+                tier_text = f", уровни: {tier_val}" if tier_val else ""
+                block_lines.append(
+                    f"  • чат <code>{chat_id}</code>: {mention} — прогресс: {progress_val}{tier_text}"
+                )
+            if len(keys) >= 50:
+                block_lines.append("  • … (обрезано до 50 записей)")
+        blocks.append("\n".join(block_lines))
+    await m.reply("\n\n".join(blocks), disable_web_page_preview=True)
+
 
 @router.message(Command("ach_reset"))
 async def cmd_ach_reset(m: Message, command: CommandObject):
@@ -669,8 +1114,13 @@ async def cmd_ach_reset(m: Message, command: CommandObject):
             user_id = int(u)
         except Exception:
             return await m.reply("Некорректный user.")
-    _exec("DELETE FROM user_achievements WHERE chat_id=? AND user_id=? AND achievement_id=?;", (m.chat.id, user_id, ach[0]))
-    await m.reply("Сброшено.")
+    progress_removed = reset_user_achievement_progress(m.chat.id, user_id, ach[1])
+    awards_removed = delete_user_achievement(m.chat.id, user_id, ach[1])
+    await m.reply(
+        "Сброшено. "
+        + f"Удалено наград: {awards_removed}. "
+        + f"Записей прогресса очищено: {progress_removed}."
+    )
 
 # =========
 # Команды: для всех
@@ -708,6 +1158,8 @@ async def cmd_ach_top(m: Message):
     if not rows:
         return await m.reply("Пока никто не получил ачивок.")
     lines = ["<b>Топ по ачивкам</b>:"]
+    profiles = _fetch_user_profiles({uid for uid, _ in rows})
     for i, (uid, cnt) in enumerate(rows, start=1):
-        lines.append(f"{i}. user_id={uid} — {cnt}")
+        mention = _format_user_mention(uid, profiles)
+        lines.append(f"{i}. {mention} — {cnt}")
     await m.reply("\n".join(lines))
