@@ -118,6 +118,96 @@ def _remove_progress_records(
     return total
 
 
+def _truncate_table(conn: sqlite3.Connection, table: str) -> int:
+    if not _table_exists_conn(conn, table):
+        return 0
+    cur = conn.execute(f"DELETE FROM {table};")
+    return cur.rowcount
+
+
+def _get_progress_value_conn(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    user_id: int,
+    ach_id: int,
+) -> int:
+    cur = conn.execute(
+        "SELECT progress FROM achievement_progress WHERE chat_id=? AND user_id=? AND achievement_id=?;",
+        (chat_id, user_id, ach_id),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _get_progress_value(chat_id: int, user_id: int, ach_id: int) -> int:
+    with closing(_conn()) as conn:
+        return _get_progress_value_conn(conn, chat_id, user_id, ach_id)
+
+
+def _increment_progress(chat_id: int, user_id: int, ach_id: int, delta: int) -> int:
+    if delta <= 0:
+        return _get_progress_value(chat_id, user_id, ach_id)
+    now = _now_ts()
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO achievement_progress(chat_id, user_id, achievement_id, progress, updated_at)
+            VALUES(?,?,?,?,?);
+            """,
+            (chat_id, user_id, ach_id, 0, now),
+        )
+        conn.execute(
+            """
+            UPDATE achievement_progress
+            SET progress = progress + ?, updated_at=?
+            WHERE chat_id=? AND user_id=? AND achievement_id=?;
+            """,
+            (delta, now, chat_id, user_id, ach_id),
+        )
+        conn.commit()
+        return _get_progress_value_conn(conn, chat_id, user_id, ach_id)
+
+
+def _fetch_user_profiles(user_ids: set[int]) -> dict[int, tuple[str | None, str | None]]:
+    if not user_ids or not _table_exists("users"):
+        return {}
+    cols = set(_table_cols("users"))
+    if "user_id" not in cols:
+        return {}
+    placeholders = ",".join("?" for _ in user_ids)
+    sel_display = "display_name" if "display_name" in cols else "username" if "username" in cols else "NULL"
+    sel_username = "username" if "username" in cols else "NULL"
+    rows = _q(
+        f"SELECT user_id, {sel_display}, {sel_username} FROM users WHERE user_id IN ({placeholders});",
+        tuple(user_ids),
+    )
+    return {int(uid): (display_name, username) for uid, display_name, username in rows}
+
+
+def _format_user_mention(user_id: int, profiles: dict[int, tuple[str | None, str | None]] | None = None) -> str:
+    display = None
+    username = None
+    if profiles and user_id in profiles:
+        display, username = profiles[user_id]
+    elif _table_exists("users"):
+        cols = set(_table_cols("users"))
+        if "user_id" in cols:
+            sel_display = "display_name" if "display_name" in cols else "username" if "username" in cols else "NULL"
+            sel_username = "username" if "username" in cols else "NULL"
+            order = " ORDER BY updated_at DESC" if "updated_at" in cols else ""
+            rows = _q(
+                f"SELECT {sel_display}, {sel_username} FROM users WHERE user_id=?{order} LIMIT 1;",
+                (user_id,),
+            )
+        else:
+            rows = []
+        if rows:
+            display, username = rows[0]
+    name = (display or username or str(user_id)).strip() or str(user_id)
+    return f'<a href="tg://user?id={user_id}">{escape(name)}</a>'
+
+
 def delete_user_achievement(chat_id: int, user_id: int, ach_code: str) -> int:
     with closing(_conn()) as conn:
         conn.execute("PRAGMA foreign_keys=ON;")
@@ -135,7 +225,15 @@ def delete_user_achievement(chat_id: int, user_id: int, ach_code: str) -> int:
             total += _delete_optional_records(
                 conn,
                 "user_achievements",
-                {"chat_id": chat_id, "user_id": user_id, "achievement_id": ach_id},
+                {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "achievement_id": ach_id,
+                    "ach_id": ach_id,
+                    "achievement_code": ach_code,
+                    "ach_code": ach_code,
+                    "code": ach_code,
+                },
             )
             total += _remove_progress_records(
                 conn,
@@ -146,6 +244,29 @@ def delete_user_achievement(chat_id: int, user_id: int, ach_code: str) -> int:
             )
             conn.commit()
             return total
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def global_reset_achievements() -> dict[str, int]:
+    with closing(_conn()) as conn:
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("BEGIN")
+        try:
+            stats: dict[str, int] = {}
+            stats["user_achievements"] = _truncate_table(conn, "user_achievements")
+            stats["achievement_progress"] = _truncate_table(conn, "achievement_progress")
+            for table in (
+                "achievements_progress",
+                "achievements_states",
+                "achievement_states",
+                "achievements_awards",
+            ):
+                stats[table] = _truncate_table(conn, table)
+            stats["achievements"] = _truncate_table(conn, "achievements")
+            conn.commit()
+            return stats
         except Exception:
             conn.rollback()
             raise
@@ -195,7 +316,13 @@ def delete_achievement_globally(ach_code: str) -> int:
             total += _delete_optional_records(
                 conn,
                 "user_achievements",
-                {"achievement_id": ach_id},
+                {
+                    "achievement_id": ach_id,
+                    "ach_id": ach_id,
+                    "achievement_code": ach_code,
+                    "ach_code": ach_code,
+                    "code": ach_code,
+                },
             )
             total += _remove_progress_records(
                 conn,
@@ -737,6 +864,31 @@ async def cmd_ach_del(m: Message, command: CommandObject):
         + (f" Очищено записей: {deleted}." if deleted else "")
     )
 
+
+@router.message(Command("ach_globalreset"))
+async def cmd_ach_globalreset(m: Message):
+    if not m.from_user or not is_admin(m.from_user.id):
+        return await m.reply("Недостаточно прав.")
+    stats = global_reset_achievements()
+    lines = ["<b>Глобальный сброс выполнен.</b>"]
+    label_map = {
+        "achievements": "achievements",
+        "user_achievements": "user_achievements",
+        "achievement_progress": "achievement_progress",
+        "achievements_progress": "achievements_progress",
+        "achievements_states": "achievements_states",
+        "achievement_states": "achievement_states",
+        "achievements_awards": "achievements_awards",
+    }
+    for key in label_map:
+        if key in stats:
+            lines.append(f"{label_map[key]}: {stats[key]}")
+    await m.reply(
+        "\n".join(lines),
+        disable_web_page_preview=True,
+        parse_mode="HTML",
+    )
+
 @router.message(Command("ach_list"))
 async def cmd_ach_list(m: Message):
     if not m.from_user or not is_admin(m.from_user.id):
@@ -941,7 +1093,11 @@ async def cmd_ach_globalview(m: Message):
             if len(keys) >= 50:
                 block_lines.append("  • … (обрезано до 50 записей)")
         blocks.append("\n".join(block_lines))
-    await m.reply("\n\n".join(blocks), disable_web_page_preview=True)
+    await m.reply(
+        "\n\n".join(blocks),
+        disable_web_page_preview=True,
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("ach_reset"))
@@ -977,7 +1133,7 @@ async def cmd_ach_reset(m: Message, command: CommandObject):
 # =========
 # Команды: для всех
 # =========
-@router.message(Command("my_achievements"))
+@router.message(Command(commands=["my_achievements", "my_ach"]))
 async def cmd_my_achievements(m: Message):
     if not m.from_user:
         return
@@ -995,7 +1151,11 @@ async def cmd_my_achievements(m: Message):
         when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
         level = f" | Уровень {tier}" if kind == "tiered" else ""
         parts.append(f"• <b>{title}</b>{level} — {desc}  <i>({when})</i>")
-    await m.reply("\n".join(parts), disable_web_page_preview=True)
+    await m.reply(
+        "\n".join(parts),
+        disable_web_page_preview=True,
+        parse_mode="HTML",
+    )
 
 @router.message(Command("ach_top"))
 async def cmd_ach_top(m: Message):
@@ -1014,4 +1174,4 @@ async def cmd_ach_top(m: Message):
     for i, (uid, cnt) in enumerate(rows, start=1):
         mention = _format_user_mention(uid, profiles)
         lines.append(f"{i}. {mention} — {cnt}")
-    await m.reply("\n".join(lines))
+    await m.reply("\n".join(lines), parse_mode="HTML")
