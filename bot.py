@@ -3,11 +3,10 @@ import asyncio
 import random
 import re
 import sqlite3
-from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from contextlib import closing, suppress
+from datetime import datetime, timezone
 import html as _html
-import re as _re
-import os, pathlib
+import pathlib
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -18,6 +17,11 @@ from aiogram.client.default import DefaultBotProperties
 
 # === achievements module (подключаем БЕЗ изменения вашего кода) ===
 from achievements import router as ach_router, init_db as ach_init_db, on_text_hook as ach_on_text_hook
+from utils.cooldowns import (
+    clear_expired_cooldowns,
+    is_on_cooldown,
+    set_cooldown,
+)
 
 # =========================
 # Config
@@ -31,6 +35,9 @@ DB = os.getenv("DB_PATH", "bot.sqlite3")
 pathlib.Path(os.path.dirname(DB) or ".").mkdir(parents=True, exist_ok=True)
 print(f"[DB] Using SQLite at: {os.path.abspath(DB)}")
 
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+MIGRATIONS_DIR = BASE_DIR / "migrations"
+
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 main_router = Router(name="main")
@@ -41,9 +48,26 @@ WATCH_USER_ID = 447968194   # @daria_mango
 NOTIFY_USER_ID = 254160871  # @misukhanov
 NOTIFY_USERNAME = "misukhanov"  # используется только для красивой подписи
 
+COOLDOWN_SCOPE_RANDOM_REPLY = "random_reply"
+COOLDOWN_TTL_RANDOM_REPLY = 3600
+COOLDOWN_CLEANUP_INTERVAL_SEC = 600
+
 # =========================
 # DB
 # =========================
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    if not MIGRATIONS_DIR.exists():
+        return
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        try:
+            sql = path.read_text(encoding="utf-8")
+        except OSError as err:
+            print(f"[MIGRATIONS] Failed to read {path}: {err}")
+            continue
+        if sql.strip():
+            conn.executescript(sql)
+
+
 def init_db():
     with closing(sqlite3.connect(DB)) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -90,6 +114,7 @@ def init_db():
             created_at INTEGER
         );
         """)
+        _apply_migrations(conn)
         conn.commit()
 
 # добавляем тонкую обёртку, чтобы ИНИЦИАЛИЗИРОВАТЬ и схемы ачивок
@@ -127,20 +152,6 @@ def get_user_messages(chat_id: int, user_id: int | None, username: str | None, l
 
 def now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
-
-# === Rate limiting for spontaneous replies ===
-LAST_INTERJECT: dict[int, int] = {}  # {chat_id: timestamp последнего "самопроизвольного" ответа}
-
-def can_interject(chat_id: int, cooldown: int = 3600) -> bool:
-    """
-    Возвращает True, если можно вставить реплику (прошёл cooldown в секундах).
-    """
-    now = now_ts()
-    last = LAST_INTERJECT.get(chat_id, 0)
-    if now - last < cooldown:
-        return False
-    LAST_INTERJECT[chat_id] = now
-    return True
 
 # =========================
 # Helpers
@@ -267,6 +278,20 @@ async def ai_reply(system_prompt: str, user_prompt: str, temperature: float = 0.
             r.raise_for_status()
             data = await r.json()
             return data["choices"][0]["message"]["content"].strip()
+
+
+async def cooldown_cleanup_worker(interval: int = COOLDOWN_CLEANUP_INTERVAL_SEC):
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                removed = clear_expired_cooldowns()
+                if removed:
+                    print(f"[COOLDOWN] Cleared {removed} expired cooldowns")
+            except Exception as err:
+                print(f"[COOLDOWN] Failed to clear expired cooldowns: {err}")
+    except asyncio.CancelledError:
+        raise
 
 # =========================
 # Linkify helpers (для саммари, в психо-аналитике не используем)
@@ -583,7 +608,7 @@ async def maybe_interject(m: Message):
     if is_quiet_hours(local_dt): return
     if not is_question(m.text or ""): return
     if random.random() > 0.33: return
-    if not can_interject(m.chat.id, cooldown=3600):  # 1800 секунд = 30 мин
+    if is_on_cooldown(COOLDOWN_SCOPE_RANDOM_REPLY, m.chat.id, None):
         return
         
     ctx_rows = db_query(
@@ -603,6 +628,7 @@ async def maybe_interject(m: Message):
         reply = await ai_reply(system, user, temperature=0.66)
         reply = strip_outer_quotes(reply)
         await m.reply(sanitize_html_whitelist(reply))
+        set_cooldown(COOLDOWN_SCOPE_RANDOM_REPLY, m.chat.id, None, COOLDOWN_TTL_RANDOM_REPLY)
     finally:
         bump_reply_counter()
 
@@ -779,17 +805,27 @@ async def main():
     print("[INIT] Initializing database...")
     init_db_with_achievements()
     print("[INIT] Database ready!")
-    
+
+    expired = clear_expired_cooldowns()
+    if expired:
+        print(f"[INIT] Cleared {expired} expired cooldowns")
+
     # Регистрируем роутер ачивок
     print("[INIT] Registering achievements router...")
     dp.include_router(ach_router)
     print("[INIT] Registering main router...")
     dp.include_router(main_router)
     print("[INIT] Routers ready!")
-    
+
     await set_commands()
     print("[START] Bot is polling...")
-    await dp.start_polling(bot)
+    cleanup_task = asyncio.create_task(cooldown_cleanup_worker())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
 
 if __name__ == "__main__":
     asyncio.run(main())
